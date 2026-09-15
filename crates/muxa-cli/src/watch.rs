@@ -15476,6 +15476,64 @@ fn extend_inspector_roster(
     )));
 }
 
+/// Box-drawing, block, and whitespace — the glyphs a TUI uses to *frame*
+/// content rather than to say anything.
+fn is_decorative(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{2500}'..='\u{259f}')
+}
+
+/// Clip `line` to `width` display cells, preserving per-span styling.
+fn clip_line(line: &Line<'static>, width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in &line.spans {
+        if used >= width {
+            break;
+        }
+        let room = width - used;
+        let text: String = span.content.chars().take(room).collect();
+        used += text.chars().count();
+        spans.push(Span::styled(text, span.style));
+    }
+    Line::from(spans)
+}
+
+/// Whether everything past `width` on this line is framing, not content.
+///
+/// A captured pane is full of boxes — an agent's input prompt is a rule, the
+/// text, then padding out to a closing `│`. Wrapping those produces a second
+/// row holding nothing but the tail of a border, which reads as a rendering
+/// fault. Wrapping a line whose overflow is real text is the opposite: that
+/// text is otherwise unreachable, since the cell has no horizontal scroll.
+fn overflow_is_decorative(line: &Line<'static>, width: usize) -> bool {
+    line.spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .skip(width)
+        .all(is_decorative)
+}
+
+/// Clip the frame, wrap the prose. Applied to a mosaic cell's capture before
+/// it is handed to a wrapping `Paragraph`: pre-clipped lines already fit, so
+/// the wrap only ever acts on lines carrying content past the edge.
+fn fit_capture_lines(text: &Text<'static>, width: usize) -> Text<'static> {
+    if width == 0 {
+        return text.clone();
+    }
+    Text::from(
+        text.lines
+            .iter()
+            .map(|line| {
+                if line.width() > width && overflow_is_decorative(line, width) {
+                    clip_line(line, width)
+                } else {
+                    line.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn matching_window_capture<'a>(app: &'a App, window: &WindowNode) -> Option<&'a CapturedWindow> {
     app.window_capture
         .as_ref()
@@ -15641,14 +15699,15 @@ fn render_window_mosaic_cell(
     // showing reflowed output drifts upward by however many lines the wrap
     // added.
     let width = usize::from(inner.width).max(1);
-    let rendered: usize = text
+    let fitted = fit_capture_lines(text, width);
+    let rendered: usize = fitted
         .lines
         .iter()
         .map(|line| line.width().max(1).div_ceil(width))
         .sum();
     let scroll = rendered.saturating_sub(usize::from(inner.height));
     f.render_widget(
-        Paragraph::new(text.clone())
+        Paragraph::new(fitted)
             .wrap(Wrap { trim: false })
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         inner,
@@ -20302,6 +20361,40 @@ mod tests {
         assert!(
             capture_row.find("LEFT CAPTURE").unwrap() < capture_row.find("RIGHT CAPTURE").unwrap()
         );
+    }
+
+    #[test]
+    fn mosaic_clips_frame_lines_and_wraps_prose() {
+        // An agent's input box: a rule, then a short prompt padded out to a
+        // closing border. Wrapping the frame produced a row holding nothing
+        // but the tail of a border.
+        let rule = Line::from("╭────────────────────────────╮");
+        let boxed = Line::from("│ > hi                      │");
+        assert!(overflow_is_decorative(&rule, 10));
+        assert!(overflow_is_decorative(&boxed, 10));
+
+        let fitted = fit_capture_lines(&Text::from(vec![rule, boxed]), 10);
+        assert_eq!(fitted.lines[0].width(), 10);
+        assert_eq!(fitted.lines[1].width(), 10);
+
+        // Real text past the edge still wraps — the cell has no horizontal
+        // scroll, so clipping it would put it out of reach entirely.
+        let prose = Line::from("the quick brown fox jumps");
+        assert!(!overflow_is_decorative(&prose, 10));
+        let fitted = fit_capture_lines(&Text::from(vec![prose.clone()]), 10);
+        assert_eq!(fitted.lines[0].width(), prose.width());
+    }
+
+    #[test]
+    fn mosaic_clip_preserves_span_styling() {
+        let line = Line::from(vec![
+            Span::styled("│", Style::default().fg(Color::Red)),
+            Span::styled("──────────", Style::default().fg(Color::Blue)),
+        ]);
+        let clipped = clip_line(&line, 4);
+        assert_eq!(clipped.width(), 4);
+        assert_eq!(clipped.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(clipped.spans[1].style.fg, Some(Color::Blue));
     }
 
     #[test]
