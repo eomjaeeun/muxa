@@ -2884,6 +2884,64 @@ impl CollaborationComposer {
     fn move_end(&mut self) {
         self.cursor = self.input.chars().count();
     }
+
+    /// First char index of the word at or before the cursor: skip any
+    /// whitespace immediately behind us, then the word body. Mirrors
+    /// readline's `backward-word`, which is what the terminal's own
+    /// `Opt+Left` does — so the composer moves the same distance the
+    /// user's shell would.
+    fn prev_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut idx = self.cursor.min(chars.len());
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        idx
+    }
+
+    /// Index just past the word at or after the cursor — `forward-word`.
+    fn next_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut idx = self.cursor.min(chars.len());
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        while idx < chars.len() && !chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        idx
+    }
+
+    fn move_word_left(&mut self) {
+        self.cursor = self.prev_word_boundary();
+    }
+
+    fn move_word_right(&mut self) {
+        self.cursor = self.next_word_boundary();
+    }
+
+    fn delete_word_left(&mut self) {
+        let target = self.prev_word_boundary();
+        if target == self.cursor {
+            return;
+        }
+        let start = char_to_byte_idx(&self.input, target);
+        let end = char_to_byte_idx(&self.input, self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor = target;
+    }
+
+    fn delete_to_home(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = char_to_byte_idx(&self.input, self.cursor);
+        self.input.replace_range(0..end, "");
+        self.cursor = 0;
+    }
 }
 
 /// Editable `:` command line, with the same UTF-8-safe cursor behavior
@@ -9948,7 +10006,17 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             && !app.event_inbox_open
             && !app.collaboration_mailbox.open
         {
-            app.edit_search(|query| query.push_str(&pasted.replace(['\r', '\n'], " ")));
+            // Same arming rule as direct typing (see the `Char(c)` arm): a
+            // paste only lands in the filter once `/` opened it. Without this
+            // an IME commit — macOS terminals deliver composed CJK text as a
+            // bracketed paste, not as keystrokes — silently seeded the query,
+            // and every plain key after it typed into a filter the user never
+            // opened.
+            if app.browse_keys_active() {
+                app.set_hint("press / to filter", HintLevel::Warn);
+            } else {
+                app.edit_search(|query| query.push_str(&pasted.replace(['\r', '\n'], " ")));
+            }
         }
         return Action::None;
     }
@@ -10210,7 +10278,15 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         // several at once. Unbound before this, and the conventional mark key.
         KeyCode::Char(' ') if app.browse_keys_active() => Action::ToggleCollaborationMark,
         // `b` is the legacy alias retained after the pair became m/M.
-        KeyCode::Char('M' | 'b') if app.browse_keys_active() => Action::OpenCollaborationMailbox,
+        // Modifier-free only: `Ctrl-B` arrives as `Char('b')` + CONTROL, and a
+        // bare char match swallowed it — opening the mailbox on a keystroke
+        // aimed at the terminal. It is tmux's own prefix, which a
+        // `display-popup` passes straight through to the popup's pty.
+        KeyCode::Char('M' | 'b')
+            if app.browse_keys_active() && !modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Action::OpenCollaborationMailbox
+        }
         KeyCode::Char('n') if app.browse_keys_active() => {
             let fallback_dir =
                 std::env::current_dir().map_or_else(|_| "~".into(), |p| p.display().to_string());
@@ -11538,6 +11614,17 @@ fn handle_collaboration_composer_event(
                 Action::None
             }
         }
+        // Mode cycling moved off `Ctrl-E`: macOS terminals send `Ctrl-E` for
+        // `Cmd+Right`, so that byte now has to mean end-of-line for the line
+        // editing below to feel like every other input on the machine.
+        // `Shift-Tab` pairs with `Tab`'s kind cycling.
+        KeyCode::BackTab => {
+            if composer_cycle_mode(app) {
+                Action::CollaborationDefaultsChanged
+            } else {
+                Action::None
+            }
+        }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let (Some(pasted), Some(composer)) =
                 (system_clipboard_text(), app.collaboration_composer.as_mut())
@@ -11548,12 +11635,67 @@ fn handle_collaboration_composer_event(
             }
             Action::None
         }
-        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if composer_cycle_mode(app) {
-                Action::CollaborationDefaultsChanged
-            } else {
-                Action::None
+        // macOS line editing. The terminal translates the user's chord into
+        // these bytes before muxa ever sees a key, so binding the byte is
+        // what makes the chord work:
+        //   Cmd+Left  -> Ctrl-A      Opt+Left      -> Alt-b
+        //   Cmd+Right -> Ctrl-E      Opt+Right     -> Alt-f
+        //   Cmd+Backspace -> Ctrl-U  Opt+Backspace -> Ctrl-W
+        KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_home();
             }
+            Action::None
+        }
+        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_end();
+            }
+            Action::None
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.delete_to_home();
+            }
+            Action::None
+        }
+        KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.delete_word_left();
+            }
+            Action::None
+        }
+        KeyCode::Char('b') if modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_word_left();
+            }
+            Action::None
+        }
+        KeyCode::Char('f') if modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_word_right();
+            }
+            Action::None
+        }
+        // Terminals that send real arrow/backspace chords rather than the
+        // readline bytes above land here.
+        KeyCode::Left if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_word_left();
+            }
+            Action::None
+        }
+        KeyCode::Right if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.move_word_right();
+            }
+            Action::None
+        }
+        KeyCode::Backspace if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            if let Some(composer) = app.collaboration_composer.as_mut() {
+                composer.delete_word_left();
+            }
+            Action::None
         }
         KeyCode::Char('/') if !modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
@@ -11561,7 +11703,12 @@ fn handle_collaboration_composer_event(
             }
             Action::None
         }
-        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+        // ALT is excluded alongside CONTROL: an unhandled `Alt-<char>` is a
+        // chord, not text. Without this `Opt+Left` (which arrives as `Alt-b`)
+        // typed a literal "b" into the message.
+        KeyCode::Char(c)
+            if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             if let Some(composer) = app.collaboration_composer.as_mut() {
                 composer.insert(c);
             }
@@ -14966,6 +15113,21 @@ fn inspector_rule(width: u16, theme: WatchThemeSpec) -> Line<'static> {
     ))
 }
 
+/// A section rule carrying its own label: `── topology ─────`. Used where the
+/// line below has to start at column 0 (a column heading), which a leading
+/// badge would otherwise displace.
+fn inspector_titled_rule(title: &str, width: u16, theme: WatchThemeSpec) -> Line<'static> {
+    let total = usize::from(width.saturating_sub(2));
+    let label = format!(" {title} ");
+    let lead = 2.min(total);
+    let tail = total.saturating_sub(lead + label.chars().count());
+    Line::from(vec![
+        Span::styled("─".repeat(lead), theme.dim_style()),
+        Span::styled(label, theme.accent_badge()),
+        Span::styled("─".repeat(tail), theme.dim_style()),
+    ])
+}
+
 fn inspector_agent_summary(agent: &Agent) -> String {
     agent
         .last_notification
@@ -15061,6 +15223,103 @@ fn inspector_attention_line(
     ])
 }
 
+/// One column layout shared by the roster header, its window rows, and its
+/// pane rows.
+///
+/// These three used to carry independent format strings, so every column
+/// landed at a different x on each: the `STATE` heading sat six cells right of
+/// the window rows' state and thirteen right of the pane rows'. A window name
+/// longer than its fixed field pushed that row's remaining columns sideways on
+/// top of it, because `{:<18}` pads but never truncates.
+///
+/// The fields below are measured from the start of the line. Window rows spend
+/// their name field from `WINDOW_INDENT`, pane rows theirs from `PANE_INDENT`
+/// (the extra room is the tree branch), and both end at the same column so
+/// everything after them lines up.
+struct RosterCols {
+    /// Last column of the name/id field, exclusive — where `A/P` begins.
+    name_end: usize,
+    counts: usize,
+    state: usize,
+    age: usize,
+    /// `None` below the width that earns a MODEL/CTX column.
+    model: Option<usize>,
+    latest: usize,
+}
+
+/// Glyph, then a space, then the name.
+const WINDOW_INDENT: usize = 2;
+/// Tree branch (4) + glyph + a space.
+const PANE_INDENT: usize = 6;
+
+impl RosterCols {
+    fn for_width(width: usize) -> Self {
+        if width >= 68 {
+            Self {
+                name_end: 26,
+                counts: 27,
+                state: 33,
+                age: 40,
+                model: Some(45),
+                latest: 61,
+            }
+        } else if width >= 56 {
+            Self {
+                name_end: 22,
+                counts: 23,
+                state: 29,
+                age: 36,
+                model: None,
+                latest: 41,
+            }
+        } else {
+            Self {
+                name_end: 18,
+                counts: 19,
+                state: 25,
+                age: 25,
+                model: None,
+                latest: 32,
+            }
+        }
+    }
+
+    fn header(&self) -> String {
+        let mut line = String::new();
+        push_at(&mut line, WINDOW_INDENT, "WINDOWS / PANES");
+        push_at(&mut line, self.counts, "A/P");
+        push_at(&mut line, self.state, "STATE");
+        if self.age != self.state {
+            push_at(&mut line, self.age, "AGE");
+        }
+        if let Some(model) = self.model {
+            push_at(&mut line, model, "MODEL/CTX");
+        }
+        push_at(&mut line, self.latest, "LATEST");
+        line
+    }
+}
+
+/// Write `text` starting at column `col`, padding with spaces to reach it.
+/// A field that overran its slot gets a single separating space rather than
+/// shoving the rest of the row right.
+fn push_at(line: &mut String, col: usize, text: &str) {
+    let current = line.chars().count();
+    if current < col {
+        line.push_str(&" ".repeat(col - current));
+    } else if current > 0 {
+        line.push(' ');
+    }
+    line.push_str(text);
+}
+
+/// Like [`push_at`] but clips `text` to the space before `limit`, so an
+/// over-long name eats its own column instead of the next one.
+fn push_field(line: &mut String, col: usize, limit: usize, text: &str) {
+    let room = limit.saturating_sub(col);
+    push_at(line, col, &truncate_chars(text, room));
+}
+
 fn inspector_window_roster_line(
     window: &WindowNode,
     width: usize,
@@ -15088,15 +15347,22 @@ fn inspector_window_roster_line(
             )
         },
     );
-    let name_width = if width >= 68 { 18 } else { 12 };
-    let body = if width >= 56 {
-        format!(" {name:<name_width$} {counts:>5} {state:<6} {age:<4} {summary}")
-    } else {
-        format!(" {name:<name_width$} {counts:>5} {state:<6} {summary}")
-    };
+    let cols = RosterCols::for_width(width);
+    let mut body = String::new();
+    push_field(&mut body, WINDOW_INDENT, cols.name_end, &name);
+    push_at(&mut body, cols.counts, &counts);
+    push_at(&mut body, cols.state, state);
+    if cols.age != cols.state {
+        push_at(&mut body, cols.age, &age);
+    }
+    // No MODEL/CTX on a window row — an aggregate has no one model. The column
+    // is left empty so LATEST still starts where the heading says it does.
+    push_at(&mut body, cols.latest, &summary);
+    // Column 0 is the glyph's own slot, rendered as its own styled span.
+    let rest: String = body.chars().skip(1).collect();
     Line::from(vec![
         Span::styled(glyph.to_string(), style),
-        Span::raw(truncate_chars(&body, width.saturating_sub(1))),
+        Span::raw(truncate_chars(&rest, width.saturating_sub(1))),
     ])
 }
 
@@ -15120,50 +15386,66 @@ fn inspector_pane_roster_line_with_prefix(
 ) -> Line<'static> {
     let prefix_width = prefix.chars().count();
     let body_width = width.saturating_sub(prefix_width.saturating_add(1));
+    let cols = RosterCols::for_width(width);
+    // The branch prefix is its own span, so the shared columns are measured
+    // from `PANE_INDENT` and the prefix's width is subtracted back out below.
+    let indent = PANE_INDENT.saturating_sub(prefix_width);
     let Some(agent) = pane.agent.as_ref() else {
-        let body = format!(
-            " {:<5} {:<8} {} · {}",
-            pane.key.pane_id, pane.current_command, pane.title, pane.cwd
+        let mut body = String::new();
+        push_field(
+            &mut body,
+            indent,
+            cols.name_end.saturating_sub(prefix_width),
+            &pane.key.pane_id,
         );
+        push_at(&mut body, cols.latest.saturating_sub(prefix_width), &format!(
+            "{} · {} · {}",
+            pane.current_command, pane.title, pane.cwd
+        ));
+        let rest: String = body.chars().skip(1).collect();
         return Line::from(vec![
             Span::styled(prefix, theme.dim_style()),
             Span::styled("○", theme.dim_style()),
-            Span::styled(truncate_chars(&body, body_width), theme.dim_style()),
+            Span::styled(truncate_chars(&rest, body_width), theme.dim_style()),
         ]);
     };
 
     let (glyph, style) = state_marker(agent.state, theme, spin);
     let age = relative_time(agent.state_entered_at, now);
     let summary = inspector_agent_summary(agent);
-    let body = if width >= 68 {
+    let shift = |col: usize| col.saturating_sub(prefix_width);
+    let mut body = String::new();
+    push_field(
+        &mut body,
+        indent,
+        shift(cols.name_end),
+        &format!("{} {}", pane.key.pane_id, agent_kind_short(agent.kind)),
+    );
+    // A pane has no A/P of its own — that column belongs to its window. Left
+    // blank so STATE still starts under its heading.
+    push_at(&mut body, shift(cols.state), state_age_label(agent.state));
+    if cols.age != cols.state {
+        push_at(&mut body, shift(cols.age), &age);
+    }
+    if let Some(model_col) = cols.model {
         let model = agent.model.as_deref().unwrap_or("—");
         let context = agent
             .context_used_pct
             .map_or_else(|| "—".into(), |value| format!("{value:.0}%"));
-        format!(
-            " {:<5} {:<8} {:<6} {:<4} {:<10} {:>4} {}",
-            pane.key.pane_id,
-            agent_kind_short(agent.kind),
-            state_age_label(agent.state),
-            age,
-            model,
-            context,
-            summary
-        )
-    } else {
-        format!(
-            " {:<5} {:<8} {:<6} {:<4} {}",
-            pane.key.pane_id,
-            agent_kind_short(agent.kind),
-            state_age_label(agent.state),
-            age,
-            summary
-        )
-    };
+        push_field(
+            &mut body,
+            shift(model_col),
+            shift(cols.latest),
+            &format!("{model} {context}"),
+        );
+    }
+    push_at(&mut body, shift(cols.latest), &summary);
+    // The glyph owns the first cell after the branch prefix.
+    let rest: String = body.chars().skip(1).collect();
     Line::from(vec![
         Span::styled(prefix, theme.dim_style()),
         Span::styled(glyph.to_string(), style),
-        Span::raw(truncate_chars(&body, body_width)),
+        Span::raw(truncate_chars(&rest, body_width)),
     ])
 }
 
@@ -15349,9 +15631,26 @@ fn render_window_mosaic_cell(
         );
         return;
     };
-    let scroll = text.lines.len().saturating_sub(usize::from(inner.height));
+    // Wrap rather than clip: a mosaic cell is far narrower than the pane it
+    // mirrors, and the horizontal offset is pinned at 0 with no way to scroll
+    // it, so anything past the cell width was simply unreachable.
+    //
+    // Wrapping changes what the vertical offset counts. `scroll` is applied by
+    // ratatui to *rendered* lines, so the offset that pins the newest output to
+    // the bottom has to be measured in wrapped lines too — otherwise a cell
+    // showing reflowed output drifts upward by however many lines the wrap
+    // added.
+    let width = usize::from(inner.width).max(1);
+    let rendered: usize = text
+        .lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum();
+    let scroll = rendered.saturating_sub(usize::from(inner.height));
     f.render_widget(
-        Paragraph::new(text.clone()).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        Paragraph::new(text.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         inner,
     );
 }
@@ -15511,20 +15810,17 @@ fn render_topology_inspector(
                     width,
                     theme,
                 ),
-                inspector_rule(area.width, theme),
-                Line::from(vec![
-                    Span::styled("topology", theme.accent_badge()),
-                    Span::styled(
-                        if width >= 68 {
-                            "  WINDOWS / PANES · A/P · STATE · AGE · MODEL/CTX · LATEST"
-                        } else if width >= 56 {
-                            "  WINDOWS / PANES · A/P · STATE · AGE · LATEST"
-                        } else {
-                            "  WINDOWS / PANES · STATE · LATEST"
-                        },
-                        theme.dim_style(),
-                    ),
-                ]),
+                // The badge rides the section rule instead of the heading row:
+                // the headings have to start at column 0 like the rows they
+                // label, and an 8-cell badge in front of them is what pushed
+                // every heading off its data. Folding it into the rule keeps
+                // the section's line count unchanged, so a short terminal
+                // still shows as many roster rows as before.
+                inspector_titled_rule("topology", area.width, theme),
+                Line::from(Span::styled(
+                    RosterCols::for_width(width).header(),
+                    theme.dim_style(),
+                )),
             ]);
             let windows = app.sorted_windows(session.windows.iter());
             let total_rows = windows
@@ -19803,9 +20099,16 @@ mod tests {
         assert!(screen.contains("attention  TEST-1/%2 · WAIT"));
         assert!(screen.contains("latest"));
         assert!(screen.contains("codex · TEST-1/%2 · review auth"));
-        assert!(
-            screen.contains("topology  WINDOWS / PANES · A/P · STATE · AGE · MODEL/CTX · LATEST")
-        );
+        // The badge now labels the section rule; the headings own their own
+        // line so each one sits above the column it names.
+        assert!(screen.contains("─ topology ─"));
+        let heading = screen
+            .lines()
+            .find(|line| line.contains("WINDOWS / PANES"))
+            .expect("column headings");
+        for column in ["A/P", "STATE", "AGE", "MODEL/CTX", "LATEST"] {
+            assert!(heading.contains(column), "missing {column} in {heading:?}");
+        }
         assert!(screen.contains("0:TEST-1"));
         assert!(screen.contains("2/2"));
         assert!(screen.contains("├─● %1"));
@@ -20564,11 +20867,7 @@ mod tests {
             Action::CollaborationDefaultsChanged
         ));
         assert!(matches!(
-            handle_collaboration_composer_event(
-                KeyCode::Char('e'),
-                KeyModifiers::CONTROL,
-                &mut app
-            ),
+            handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::SHIFT, &mut app),
             Action::CollaborationDefaultsChanged
         ));
         let composer = app.collaboration_composer.as_ref().unwrap();
@@ -22084,11 +22383,7 @@ mod tests {
             ComposeSendMode::JustSend,
             ComposeSendMode::ReadOnly,
         ] {
-            handle_collaboration_composer_event(
-                KeyCode::Char('e'),
-                KeyModifiers::CONTROL,
-                &mut app,
-            );
+            handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::SHIFT, &mut app);
             assert_eq!(mode_of(&app), expected);
         }
     }
@@ -22105,11 +22400,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            handle_collaboration_composer_event(
-                KeyCode::Char('e'),
-                KeyModifiers::CONTROL,
-                &mut app
-            ),
+            handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::SHIFT, &mut app),
             Action::CollaborationDefaultsChanged
         ));
         app.collaboration_composer = None;
@@ -22134,11 +22425,7 @@ mod tests {
         open_watch_collaboration_composer(&mut app);
         // ReadOnly -> Execute -> JustSend
         for _ in 0..2 {
-            handle_collaboration_composer_event(
-                KeyCode::Char('e'),
-                KeyModifiers::CONTROL,
-                &mut app,
-            );
+            handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::SHIFT, &mut app);
         }
         app.collaboration_composer.as_mut().unwrap().insert('안');
         let action =
@@ -22272,7 +22559,7 @@ mod tests {
         assert_eq!(border, Color::Cyan);
 
         handle_collaboration_composer_event(KeyCode::Tab, KeyModifiers::NONE, &mut app);
-        handle_collaboration_composer_event(KeyCode::Char('e'), KeyModifiers::CONTROL, &mut app);
+        handle_collaboration_composer_event(KeyCode::BackTab, KeyModifiers::SHIFT, &mut app);
         let composer = app.collaboration_composer.as_ref().unwrap();
         let (title, border) = collaboration_composer_title(composer, theme);
         let text = title
@@ -27925,10 +28212,19 @@ sort = ["state"]
     }
 
     #[test]
-    fn paste_outside_composer_becomes_search_query() {
+    fn paste_outside_composer_needs_the_filter_armed() {
+        // An unarmed paste is ignored, not silently filtered: macOS terminals
+        // deliver an IME commit as a bracketed paste, so typing Korean in the
+        // table used to seed the query and turn every later keystroke into
+        // filter input.
         let mut app = app_with_paneless_and_pane();
-        let action = handle_event(Event::Paste("junk".into()), &mut app);
+        let action = handle_event(Event::Paste("한글".into()), &mut app);
         assert!(matches!(action, Action::None));
+        assert_eq!(app.search_query, "");
+
+        // Armed with `/`, it behaves as before.
+        app.arm_explicit_search();
+        handle_event(Event::Paste("junk".into()), &mut app);
         assert_eq!(app.search_query, "junk");
     }
 
