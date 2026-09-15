@@ -15513,9 +15513,86 @@ fn overflow_is_decorative(line: &Line<'static>, width: usize) -> bool {
         .all(is_decorative)
 }
 
-/// Clip the frame, wrap the prose. Applied to a mosaic cell's capture before
-/// it is handed to a wrapping `Paragraph`: pre-clipped lines already fit, so
-/// the wrap only ever acts on lines carrying content past the edge.
+/// Shrink runs of repeated framing glyphs until the line fits, keeping both
+/// ends intact. Returns `None` when the filler cannot absorb the overflow.
+///
+/// A TUI's horizontal rules are load-bearing at their *ends* — `──── session
+/// ────`, a right-aligned `Update installed` — while the middle is a hundred
+/// identical dashes. Clipping throws the right end away and wrapping spills it
+/// onto a line of its own; taking the dashes out of the middle costs nothing
+/// anyone was reading.
+fn collapse_filler(line: &Line<'static>, width: usize) -> Option<Line<'static>> {
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+        .collect();
+    let mut excess = cells.len().checked_sub(width)?;
+
+    // Runs of one repeated framing glyph, longest first. A run has to be long
+    // enough that shortening it reads as "the rule is shorter" rather than as
+    // damage.
+    const MIN_RUN: usize = 3;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0;
+    while index < cells.len() {
+        let (c, _) = cells[index];
+        let mut end = index + 1;
+        while end < cells.len() && cells[end].0 == c {
+            end += 1;
+        }
+        if is_decorative(c) && end - index >= MIN_RUN {
+            runs.push((index, end - index));
+        }
+        index = end;
+    }
+    runs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+
+    let mut drop = vec![false; cells.len()];
+    for (start, len) in runs {
+        if excess == 0 {
+            break;
+        }
+        // Leave one glyph behind so the run is still visibly a rule.
+        let take = (len - 1).min(excess);
+        for slot in drop.iter_mut().skip(start).take(take) {
+            *slot = true;
+        }
+        excess -= take;
+    }
+    if excess > 0 {
+        return None;
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let mut current_style: Option<Style> = None;
+    for (index, (c, style)) in cells.into_iter().enumerate() {
+        if drop[index] {
+            continue;
+        }
+        if current_style != Some(style) {
+            if let Some(previous) = current_style.take() {
+                spans.push(Span::styled(std::mem::take(&mut current), previous));
+            }
+            current_style = Some(style);
+        }
+        current.push(c);
+    }
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current, style));
+    }
+    Some(Line::from(spans))
+}
+
+/// Fit the frame, wrap the prose. Applied to a mosaic cell's capture before it
+/// is handed to a wrapping `Paragraph`, so the wrap only ever acts on lines
+/// still carrying content past the edge.
+///
+/// Three outcomes, in order of how much they preserve: shorten the filler in a
+/// framed line so both ends survive; clip a line whose tail is only framing;
+/// otherwise leave it to wrap, because text out there has nowhere else to go —
+/// the cell has no horizontal scroll.
 fn fit_capture_lines(text: &Text<'static>, width: usize) -> Text<'static> {
     if width == 0 {
         return text.clone();
@@ -15524,11 +15601,16 @@ fn fit_capture_lines(text: &Text<'static>, width: usize) -> Text<'static> {
         text.lines
             .iter()
             .map(|line| {
-                if line.width() > width && overflow_is_decorative(line, width) {
-                    clip_line(line, width)
-                } else {
-                    line.clone()
+                if line.width() <= width {
+                    return line.clone();
                 }
+                if let Some(collapsed) = collapse_filler(line, width) {
+                    return collapsed;
+                }
+                if overflow_is_decorative(line, width) {
+                    return clip_line(line, width);
+                }
+                line.clone()
             })
             .collect::<Vec<_>>(),
     )
@@ -20364,23 +20446,50 @@ mod tests {
     }
 
     #[test]
-    fn mosaic_clips_frame_lines_and_wraps_prose() {
-        // An agent's input box: a rule, then a short prompt padded out to a
-        // closing border. Wrapping the frame produced a row holding nothing
-        // but the tail of a border.
-        let rule = Line::from("╭────────────────────────────╮");
-        let boxed = Line::from("│ > hi                      │");
-        assert!(overflow_is_decorative(&rule, 10));
-        assert!(overflow_is_decorative(&boxed, 10));
+    fn mosaic_shortens_a_rule_instead_of_wrapping_it() {
+        // A rule that carries text at its right end: clipping loses the text,
+        // wrapping spills it onto a row of its own. Shorten the dashes.
+        let rule = Line::from("──────────────────── my-session ────");
+        let fitted = fit_capture_lines(&Text::from(vec![rule]), 20);
+        let text = fitted.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(fitted.lines[0].width(), 20);
+        assert!(text.contains("my-session"), "right end lost: {text:?}");
+        assert!(text.starts_with('─'), "left end lost: {text:?}");
+    }
 
-        let fitted = fit_capture_lines(&Text::from(vec![rule, boxed]), 10);
+    #[test]
+    fn mosaic_fits_a_framed_prompt_without_adding_a_row() {
+        // An agent's input box: a rule, then a short prompt padded out to a
+        // closing border. Both fit by shortening their filler.
+        let fitted = fit_capture_lines(
+            &Text::from(vec![
+                Line::from("╭────────────────────────────╮"),
+                Line::from("│ > hi                      │"),
+            ]),
+            10,
+        );
         assert_eq!(fitted.lines[0].width(), 10);
         assert_eq!(fitted.lines[1].width(), 10);
+        let boxed = fitted.lines[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(boxed.contains("hi"), "prompt text lost: {boxed:?}");
+        assert!(boxed.ends_with('│'), "closing border lost: {boxed:?}");
+    }
 
+    #[test]
+    fn mosaic_still_wraps_prose_with_no_filler_to_give() {
         // Real text past the edge still wraps — the cell has no horizontal
         // scroll, so clipping it would put it out of reach entirely.
         let prose = Line::from("the quick brown fox jumps");
         assert!(!overflow_is_decorative(&prose, 10));
+        assert!(collapse_filler(&prose, 10).is_none());
         let fitted = fit_capture_lines(&Text::from(vec![prose.clone()]), 10);
         assert_eq!(fitted.lines[0].width(), prose.width());
     }
