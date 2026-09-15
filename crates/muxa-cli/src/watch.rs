@@ -15482,6 +15482,42 @@ fn is_decorative(c: char) -> bool {
     c.is_whitespace() || matches!(c, '\u{2500}'..='\u{259f}')
 }
 
+/// Box-drawing or block, excluding whitespace.
+fn is_frame_glyph(c: char) -> bool {
+    matches!(c, '\u{2500}'..='\u{259f}')
+}
+
+/// Whether this line is part of a drawn box — its first or last visible glyph
+/// is a border. Only such a line may have its internal whitespace shortened.
+fn is_framed(cells: &[(char, Style)]) -> bool {
+    let mut visible = cells.iter().map(|&(c, _)| c).filter(|c| !c.is_whitespace());
+    let first = visible.next();
+    let last = visible.last().or(first);
+    first.is_some_and(is_frame_glyph) || last.is_some_and(is_frame_glyph)
+}
+
+/// Drop the padding `capture-pane` adds to reach the pane's width.
+///
+/// Every captured line arrives padded out to the full pane width, so a cell
+/// narrower than the pane sees *every* line as overflowing — including short
+/// ones whose only excess is that padding.
+fn trim_trailing_blanks(line: &Line<'static>) -> Line<'static> {
+    let mut spans = line.spans.clone();
+    while let Some(last) = spans.last_mut() {
+        let trimmed = last.content.trim_end();
+        if trimmed.len() == last.content.len() {
+            break;
+        }
+        if trimmed.is_empty() {
+            spans.pop();
+        } else {
+            *last = Span::styled(trimmed.to_string(), last.style);
+            break;
+        }
+    }
+    Line::from(spans)
+}
+
 /// Clip `line` to `width` display cells, preserving per-span styling.
 fn clip_line(line: &Line<'static>, width: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -15528,6 +15564,7 @@ fn collapse_filler(line: &Line<'static>, width: usize) -> Option<Line<'static>> 
         .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
         .collect();
     let mut excess = cells.len().checked_sub(width)?;
+    let framed = is_framed(&cells);
 
     // Runs of one repeated framing glyph, longest first. A run has to be long
     // enough that shortening it reads as "the rule is shorter" rather than as
@@ -15541,7 +15578,16 @@ fn collapse_filler(line: &Line<'static>, width: usize) -> Option<Line<'static>> 
         while end < cells.len() && cells[end].0 == c {
             end += 1;
         }
-        if is_decorative(c) && end - index >= MIN_RUN {
+        // Whitespace is only filler inside a box. Padding between columns of
+        // ordinary output is load-bearing — squeezing it runs a table
+        // together — whereas the gap between a prompt's text and its closing
+        // `│` exists to reach the border and for nothing else.
+        let collapsible = if c.is_whitespace() {
+            framed
+        } else {
+            is_decorative(c)
+        };
+        if collapsible && end - index >= MIN_RUN {
             runs.push((index, end - index));
         }
         index = end;
@@ -15654,14 +15700,15 @@ fn fit_capture_lines(text: &Text<'static>, width: usize) -> Text<'static> {
     }
     let mut rows: Vec<Line<'static>> = Vec::new();
     for line in &text.lines {
+        let line = trim_trailing_blanks(line);
         if line.width() <= width {
-            rows.push(line.clone());
-        } else if let Some(collapsed) = collapse_filler(line, width) {
+            rows.push(line);
+        } else if let Some(collapsed) = collapse_filler(&line, width) {
             rows.push(collapsed);
-        } else if overflow_is_decorative(line, width) {
-            rows.push(clip_line(line, width));
+        } else if overflow_is_decorative(&line, width) {
+            rows.push(clip_line(&line, width));
         } else {
-            rows.extend(hard_wrap_line(line, width));
+            rows.extend(hard_wrap_line(&line, width));
         }
     }
     Text::from(rows)
@@ -20566,6 +20613,43 @@ mod tests {
         for row in &fitted.lines {
             assert!(row.width() <= 12, "row overflows: {:?}", row.width());
         }
+    }
+
+    /// `capture-pane` pads every line out to the pane's width, so a cell
+    /// narrower than the pane saw all of them as overflowing — and the pad was
+    /// filler fat enough to absorb the excess, which squeezed real output onto
+    /// one row instead of letting it break.
+    #[test]
+    fn mosaic_ignores_the_padding_capture_pane_adds() {
+        let padded = Line::from(format!("{:<80}", "hello"));
+        let fitted = fit_capture_lines(&Text::from(vec![padded]), 10);
+        assert_eq!(fitted.lines.len(), 1);
+        let text = fitted.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "hello");
+    }
+
+    /// Column padding outside a box is load-bearing: collapsing it runs a
+    /// table together on one row rather than breaking it across two.
+    #[test]
+    fn mosaic_keeps_column_padding_and_breaks_instead() {
+        let row = Line::from(format!("{:<20}{:<20}{:<20}", "alpha", "beta", "gamma"));
+        assert!(collapse_filler(&row, 20).is_none());
+
+        let fitted = fit_capture_lines(&Text::from(vec![row]), 20);
+        assert!(fitted.lines.len() > 1, "row was squeezed onto one line");
+        let first = fitted.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            first.starts_with("alpha") && first.contains("   "),
+            "padding lost: {first:?}"
+        );
     }
 
     #[test]
