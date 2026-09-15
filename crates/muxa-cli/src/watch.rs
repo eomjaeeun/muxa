@@ -15585,35 +15585,86 @@ fn collapse_filler(line: &Line<'static>, width: usize) -> Option<Line<'static>> 
     Some(Line::from(spans))
 }
 
-/// Fit the frame, wrap the prose. Applied to a mosaic cell's capture before it
-/// is handed to a wrapping `Paragraph`, so the wrap only ever acts on lines
-/// still carrying content past the edge.
+/// Break `line` into rows of at most `width` cells, splitting on cell count
+/// rather than on words and carrying each span's style across the break.
 ///
-/// Three outcomes, in order of how much they preserve: shorten the filler in a
-/// framed line so both ends survive; clip a line whose tail is only framing;
-/// otherwise leave it to wrap, because text out there has nowhere else to go —
-/// the cell has no horizontal scroll.
+/// Terminal output is columnar, so a hard break keeps whatever alignment the
+/// captured program drew; a word wrapper would reflow it. Doing the break here
+/// rather than in `Paragraph` is also what makes the row count *known* — see
+/// [`fit_capture_lines`].
+fn hard_wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let mut current_style: Option<Style> = None;
+    let mut used = 0usize;
+
+    let flush_span = |current: &mut String, style: Option<Style>, spans: &mut Vec<Span<'_>>| {
+        if !current.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(current),
+                style.unwrap_or_default(),
+            ));
+        }
+    };
+
+    for span in &line.spans {
+        for c in span.content.chars() {
+            let cells = UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + cells > width && used > 0 {
+                flush_span(&mut current, current_style, &mut spans);
+                rows.push(Line::from(std::mem::take(&mut spans)));
+                used = 0;
+                current_style = None;
+            }
+            if current_style != Some(span.style) {
+                flush_span(&mut current, current_style, &mut spans);
+                current_style = Some(span.style);
+            }
+            current.push(c);
+            used += cells;
+        }
+    }
+    flush_span(&mut current, current_style, &mut spans);
+    if !spans.is_empty() || rows.is_empty() {
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
+/// Fit a mosaic cell's capture to `width`, returning rows that each already
+/// fit — so the caller can render without `Paragraph`'s wrapping and know
+/// exactly how many rows it produced.
+///
+/// That exactness is the point. The bottom-pinning offset is a row count, and
+/// estimating it against `Paragraph`'s word wrapper ran short whenever a long
+/// word bumped to the next row: the cell then scrolled too little and cut off
+/// the newest output, irregularly, depending on what the pane happened to be
+/// printing.
+///
+/// Three outcomes per line, in order of how much they preserve: shorten the
+/// filler in a framed line so both ends survive; clip a line whose tail is
+/// only framing; otherwise break it across rows, because text out there has
+/// nowhere else to go — the cell has no horizontal scroll.
 fn fit_capture_lines(text: &Text<'static>, width: usize) -> Text<'static> {
     if width == 0 {
         return text.clone();
     }
-    Text::from(
-        text.lines
-            .iter()
-            .map(|line| {
-                if line.width() <= width {
-                    return line.clone();
-                }
-                if let Some(collapsed) = collapse_filler(line, width) {
-                    return collapsed;
-                }
-                if overflow_is_decorative(line, width) {
-                    return clip_line(line, width);
-                }
-                line.clone()
-            })
-            .collect::<Vec<_>>(),
-    )
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for line in &text.lines {
+        if line.width() <= width {
+            rows.push(line.clone());
+        } else if let Some(collapsed) = collapse_filler(line, width) {
+            rows.push(collapsed);
+        } else if overflow_is_decorative(line, width) {
+            rows.push(clip_line(line, width));
+        } else {
+            rows.extend(hard_wrap_line(line, width));
+        }
+    }
+    Text::from(rows)
 }
 
 fn matching_window_capture<'a>(app: &'a App, window: &WindowNode) -> Option<&'a CapturedWindow> {
@@ -15781,17 +15832,13 @@ fn render_window_mosaic_cell(
     // showing reflowed output drifts upward by however many lines the wrap
     // added.
     let width = usize::from(inner.width).max(1);
+    // Every row out of `fit_capture_lines` already fits, so the paragraph does
+    // no wrapping of its own and the row count below is exact rather than an
+    // estimate of what a word wrapper would have done.
     let fitted = fit_capture_lines(text, width);
-    let rendered: usize = fitted
-        .lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum();
-    let scroll = rendered.saturating_sub(usize::from(inner.height));
+    let scroll = fitted.lines.len().saturating_sub(usize::from(inner.height));
     f.render_widget(
-        Paragraph::new(fitted)
-            .wrap(Wrap { trim: false })
-            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        Paragraph::new(fitted).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         inner,
     );
 }
@@ -20484,14 +20531,53 @@ mod tests {
     }
 
     #[test]
-    fn mosaic_still_wraps_prose_with_no_filler_to_give() {
-        // Real text past the edge still wraps — the cell has no horizontal
-        // scroll, so clipping it would put it out of reach entirely.
+    fn mosaic_breaks_prose_across_rows_with_no_filler_to_give() {
+        // Real text past the edge is kept, on extra rows — the cell has no
+        // horizontal scroll, so clipping would put it out of reach entirely.
         let prose = Line::from("the quick brown fox jumps");
         assert!(!overflow_is_decorative(&prose, 10));
         assert!(collapse_filler(&prose, 10).is_none());
+
         let fitted = fit_capture_lines(&Text::from(vec![prose.clone()]), 10);
-        assert_eq!(fitted.lines[0].width(), prose.width());
+        assert_eq!(fitted.lines.len(), 3);
+        for row in &fitted.lines {
+            assert!(row.width() <= 10, "row overflows: {:?}", row.width());
+        }
+        let rejoined = fitted
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert_eq!(rejoined, "the quick brown fox jumps");
+    }
+
+    /// The bottom-pinning offset is `rows - height`, so every row a cell
+    /// renders has to be one this function produced. An estimate against
+    /// `Paragraph`'s word wrapper ran short and cut off the newest output.
+    #[test]
+    fn mosaic_rows_all_fit_so_the_row_count_is_exact() {
+        let text = Text::from(vec![
+            Line::from("short"),
+            Line::from("──────────────────── my-session ────"),
+            Line::from("a very long line of terminal output that must break"),
+            Line::from("한글은두칸을차지하므로칸수로끊어야한다"),
+        ]);
+        let fitted = fit_capture_lines(&text, 12);
+        for row in &fitted.lines {
+            assert!(row.width() <= 12, "row overflows: {:?}", row.width());
+        }
+    }
+
+    #[test]
+    fn mosaic_hard_wrap_keeps_span_styling_across_a_break() {
+        let line = Line::from(vec![
+            Span::styled("aaaaa", Style::default().fg(Color::Red)),
+            Span::styled("bbbbb", Style::default().fg(Color::Blue)),
+        ]);
+        let rows = hard_wrap_line(&line, 4);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(rows[2].spans.last().unwrap().style.fg, Some(Color::Blue));
     }
 
     #[test]
