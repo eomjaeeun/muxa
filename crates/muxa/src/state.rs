@@ -38,7 +38,15 @@ use tokio::sync::{broadcast, watch, Notify, RwLock};
 /// Kept here (not in the runtime crate) so the no-I/O store layer can dedup
 /// without taking a cross-crate dependency on the discovery module.
 pub const SYNTHETIC_SESSION_PREFIX: &str = "synthetic-";
-const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
+/// Claude Code fires a `Notification` hook carrying exactly this message
+/// whenever its prompt has sat idle for roughly a minute. Nothing is
+/// blocked when it arrives — the turn simply ended and the operator has
+/// not typed yet — so it must not be read as a request for input.
+///
+/// [`is_legacy_claude_idle_prompt_wait`] uses it to repair rows that an
+/// older build parked in [`AgentState::WaitingInput`]; `muxa-cli`'s watch
+/// roster uses it to keep the notification from masking the LATEST column.
+pub const CLAUDE_IDLE_PROMPT_NOTIFICATION: &str = "Claude is waiting for your input";
 
 fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)

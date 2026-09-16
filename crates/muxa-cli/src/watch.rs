@@ -49,7 +49,7 @@ use muxa::event::RateLimitScope;
 use muxa::ipc::{Client, RuntimeError, VersionSkew};
 use muxa::process_tree::WorkloadProcessKind;
 use muxa::session_activity::SessionActivity;
-use muxa::state::Agent;
+use muxa::state::{Agent, CLAUDE_IDLE_PROMPT_NOTIFICATION};
 use muxa::tmux::layout::PaneGeometry;
 use muxa::tmux::{PaneInfo, SessionInfo};
 use muxa::{
@@ -3625,9 +3625,7 @@ impl App {
                     || agent.session_id.clone(),
                     |_| agent_pane_display(agent, &self.panes),
                 );
-                let summary = agent
-                    .last_notification
-                    .as_deref()
+                let summary = actionable_notification(agent)
                     .or(agent.last_response.as_deref())
                     .or(agent.last_prompt.as_deref())
                     .unwrap_or("")
@@ -15007,9 +15005,7 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&
             Span::styled("model ", theme.dim_style()),
             Span::raw(agent.model.as_deref().unwrap_or("—").to_string()),
         ]));
-        let summary = agent
-            .last_notification
-            .as_deref()
+        let summary = actionable_notification(agent)
             .or(agent.last_prompt.as_deref())
             .unwrap_or("—")
             .replace('\n', " ");
@@ -15128,10 +15124,26 @@ fn inspector_titled_rule(title: &str, width: u16, theme: WatchThemeSpec) -> Line
     ])
 }
 
-fn inspector_agent_summary(agent: &Agent) -> String {
+/// The `last_notification`, but only when it says something the operator
+/// has to act on.
+///
+/// Claude Code posts [`CLAUDE_IDLE_PROMPT_NOTIFICATION`] on every agent whose
+/// prompt has sat idle for about a minute, so it is present on nearly every
+/// resting row. Left at the head of a summary chain it wins over the prompt
+/// and the response, painting one identical sentence down the whole LATEST
+/// column and hiding what each agent was actually doing — the column's only
+/// reason to exist. `state.rs` already refuses to read that message as a
+/// request for input; this keeps the display saying the same thing. A real
+/// `permission_prompt` carries different text and still takes priority.
+fn actionable_notification(agent: &Agent) -> Option<&str> {
     agent
         .last_notification
         .as_deref()
+        .filter(|message| message.trim() != CLAUDE_IDLE_PROMPT_NOTIFICATION)
+}
+
+fn inspector_agent_summary(agent: &Agent) -> String {
+    actionable_notification(agent)
         .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
         .unwrap_or("—")
@@ -16909,9 +16921,7 @@ fn topology_agent_summary(agent: &Agent, layout: WatchLayout) -> String {
     let raw = if layout == WatchLayout::Swarm {
         swarm_topology_agent_summary(agent)
     } else {
-        agent
-            .last_notification
-            .as_deref()
+        actionable_notification(agent)
             .or(agent.summary_text())
             .or(agent.last_prompt.as_deref())
             .map_or_else(|| agent.state.to_string(), str::to_string)
@@ -17033,9 +17043,7 @@ fn swarm_topology_agent_summary(agent: &Agent) -> String {
                 .join(", "),
         );
     }
-    let activity = agent
-        .last_notification
-        .as_deref()
+    let activity = actionable_notification(agent)
         .or(agent.summary_text())
         .or(agent.last_prompt.as_deref())
         .unwrap_or("waiting")
@@ -18967,6 +18975,41 @@ mod tests {
         assert!(
             screen.contains('✓'),
             "done pulse ✓ should overlay the State cell:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn idle_prompt_notification_does_not_mask_the_latest_column() {
+        let mut agent = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            Some("rebuild the fuzzer image"),
+            None,
+            None,
+            None,
+        );
+
+        // Nothing posted yet: the prompt is what the operator needs to see.
+        assert_eq!(inspector_agent_summary(&agent), "rebuild the fuzzer image");
+
+        // Claude posts this on every agent idling at its prompt, so it is
+        // set on nearly every resting row. If it displaced the prompt the
+        // whole LATEST column would read one identical sentence.
+        agent.last_notification = Some(CLAUDE_IDLE_PROMPT_NOTIFICATION.into());
+        assert_eq!(actionable_notification(&agent), None);
+        assert_eq!(inspector_agent_summary(&agent), "rebuild the fuzzer image");
+        assert_eq!(
+            topology_agent_summary(&agent, WatchLayout::Tree),
+            "rebuild the fuzzer image"
+        );
+
+        // A permission prompt is a real request for input and still wins.
+        agent.last_notification = Some("approve permission to run rm -rf?".into());
+        assert_eq!(
+            inspector_agent_summary(&agent),
+            "approve permission to run rm -rf?"
         );
     }
 
