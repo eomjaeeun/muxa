@@ -15501,8 +15501,12 @@ fn is_framed(cells: &[(char, Style)]) -> bool {
 /// Every captured line arrives padded out to the full pane width, so a cell
 /// narrower than the pane sees *every* line as overflowing — including short
 /// ones whose only excess is that padding.
-fn trim_trailing_blanks(line: &Line<'static>) -> Line<'static> {
-    let mut spans = line.spans.clone();
+fn trim_trailing_blanks(line: &Line<'_>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|span| Span::styled(span.content.to_string(), span.style))
+        .collect();
     while let Some(last) = spans.last_mut() {
         let trimmed = last.content.trim_end();
         if trimmed.len() == last.content.len() {
@@ -15519,7 +15523,7 @@ fn trim_trailing_blanks(line: &Line<'static>) -> Line<'static> {
 }
 
 /// Clip `line` to `width` display cells, preserving per-span styling.
-fn clip_line(line: &Line<'static>, width: usize) -> Line<'static> {
+fn clip_line(line: &Line<'_>, width: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in &line.spans {
@@ -15541,7 +15545,7 @@ fn clip_line(line: &Line<'static>, width: usize) -> Line<'static> {
 /// row holding nothing but the tail of a border, which reads as a rendering
 /// fault. Wrapping a line whose overflow is real text is the opposite: that
 /// text is otherwise unreachable, since the cell has no horizontal scroll.
-fn overflow_is_decorative(line: &Line<'static>, width: usize) -> bool {
+fn overflow_is_decorative(line: &Line<'_>, width: usize) -> bool {
     line.spans
         .iter()
         .flat_map(|span| span.content.chars())
@@ -15557,7 +15561,7 @@ fn overflow_is_decorative(line: &Line<'static>, width: usize) -> bool {
 /// identical dashes. Clipping throws the right end away and wrapping spills it
 /// onto a line of its own; taking the dashes out of the middle costs nothing
 /// anyone was reading.
-fn collapse_filler(line: &Line<'static>, width: usize) -> Option<Line<'static>> {
+fn collapse_filler(line: &Line<'_>, width: usize) -> Option<Line<'static>> {
     let cells: Vec<(char, Style)> = line
         .spans
         .iter()
@@ -15638,7 +15642,7 @@ fn collapse_filler(line: &Line<'static>, width: usize) -> Option<Line<'static>> 
 /// captured program drew; a word wrapper would reflow it. Doing the break here
 /// rather than in `Paragraph` is also what makes the row count *known* — see
 /// [`fit_capture_lines`].
-fn hard_wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+fn hard_wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthChar;
 
     let mut rows: Vec<Line<'static>> = Vec::new();
@@ -15694,9 +15698,14 @@ fn hard_wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// filler in a framed line so both ends survive; clip a line whose tail is
 /// only framing; otherwise break it across rows, because text out there has
 /// nowhere else to go — the cell has no horizontal scroll.
-fn fit_capture_lines(text: &Text<'static>, width: usize) -> Text<'static> {
+fn fit_capture_lines(text: &Text<'_>, width: usize) -> Text<'static> {
     if width == 0 {
-        return text.clone();
+        return Text::from(
+            text.lines
+                .iter()
+                .map(|line| clip_line(line, usize::MAX))
+                .collect::<Vec<_>>(),
+        );
     }
     let mut rows: Vec<Line<'static>> = Vec::new();
     for line in &text.lines {
@@ -16332,14 +16341,22 @@ fn render_topology_inspector(
                 }
             }
             pane_lines.push(inspector_rule(area.width, theme));
-            pane_lines.extend(
-                build_pane_capture_body_on(
-                    app,
-                    &pane.key.pane_id,
-                    Some(&pane.key.window.session.endpoint.socket),
-                )
-                .lines,
+            // Fit and bottom-pin the capture the same way a mosaic cell does.
+            // This used to append the raw capture and render with no scroll,
+            // so the panel showed the *top* of the pane — its startup banner —
+            // and clipped whatever the agent had just printed.
+            let capture = build_pane_capture_body_on(
+                app,
+                &pane.key.pane_id,
+                Some(&pane.key.window.session.endpoint.socket),
             );
+            let capture_width = usize::from(area.width.saturating_sub(2)).max(1);
+            let fitted = fit_capture_lines(&capture, capture_width);
+            // Borders, the status line inserted below, and the metadata above.
+            let room = usize::from(area.height.saturating_sub(2))
+                .saturating_sub(pane_lines.len().saturating_add(1));
+            let skip = fitted.lines.len().saturating_sub(room);
+            pane_lines.extend(fitted.lines.into_iter().skip(skip));
             (
                 format!(" Inspector · pane {} ", pane.key.pane_id),
                 pane_lines,
@@ -20312,6 +20329,46 @@ mod tests {
         assert!(screen.contains("Inspector · session muxa"));
         assert!(screen.contains("2 panes"));
         assert!(!screen.contains("SHOULD-NOT-LEAK"));
+    }
+
+    /// The pane inspector used to append the raw capture and render with no
+    /// scroll, so it showed the *top* of the pane — a startup banner — and
+    /// clipped whatever the agent had just printed.
+    #[test]
+    fn pane_inspector_shows_the_end_of_the_capture() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let capture = (0..60)
+            .map(|index| format!("capture line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.pane_capture = Some(CapturedPane::new(
+            "%1".into(),
+            Some("default".into()),
+            capture,
+        ));
+        let pane_key = app.topology.sessions[0].windows[0].panes[0].node_key();
+        select_tree_key(&mut app, &pane_key);
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Inspector · pane %1"));
+        assert!(
+            screen.contains("capture line 59"),
+            "newest capture line missing — inspector is still pinned to the top"
+        );
+        assert!(
+            !screen.contains("capture line 0 "),
+            "oldest capture line shown; the panel did not scroll"
+        );
     }
 
     #[test]
