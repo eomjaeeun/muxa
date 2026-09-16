@@ -15707,8 +15707,19 @@ fn fit_capture_lines(text: &Text<'_>, width: usize) -> Text<'static> {
                 .collect::<Vec<_>>(),
         );
     }
+    // `capture-pane` returns the pane's whole screen, blank rows included, and
+    // a shell that has printed one prompt is 71 of those. Pinning the view to
+    // the last row would then show the bottom of the blanks and nothing else —
+    // the cell rendered empty while the prompt sat off the top. Agent panes
+    // hid this: they fill their screen, so their blank tail is a row or two.
+    let content_end = text
+        .lines
+        .iter()
+        .rposition(|line| !trim_trailing_blanks(line).spans.is_empty())
+        .map_or(0, |index| index + 1);
+
     let mut rows: Vec<Line<'static>> = Vec::new();
-    for line in &text.lines {
+    for line in text.lines.iter().take(content_end) {
         let line = trim_trailing_blanks(line);
         if line.width() <= width {
             rows.push(line);
@@ -20687,6 +20698,40 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(text, "hello");
+    }
+
+    /// `capture-pane` returns the pane's whole screen. A shell that has
+    /// printed one prompt is that line plus ~70 blank rows, so pinning to the
+    /// last row showed the bottom of the blanks and the prompt sat off the
+    /// top — the cell looked empty. Agent panes hid this by filling theirs.
+    #[test]
+    fn mosaic_drops_the_blank_rows_below_a_shell_prompt() {
+        let mut lines = vec![Line::from("user@host ~ %")];
+        lines.extend(std::iter::repeat_n(Line::from(" ".repeat(80)), 70));
+
+        let fitted = fit_capture_lines(&Text::from(lines), 40);
+        assert_eq!(fitted.lines.len(), 1);
+        let text = fitted.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "user@host ~ %");
+    }
+
+    /// Blank rows *between* content are real screen layout and stay.
+    #[test]
+    fn mosaic_keeps_blank_rows_between_content() {
+        let fitted = fit_capture_lines(
+            &Text::from(vec![
+                Line::from("first"),
+                Line::from("   "),
+                Line::from("last"),
+                Line::from("   "),
+            ]),
+            40,
+        );
+        assert_eq!(fitted.lines.len(), 3);
     }
 
     /// Column padding outside a box is load-bearing: collapsing it runs a
