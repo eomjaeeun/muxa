@@ -15524,16 +15524,33 @@ fn trim_trailing_blanks(line: &Line<'_>) -> Line<'static> {
 
 /// Clip `line` to `width` display cells, preserving per-span styling.
 fn clip_line(line: &Line<'_>, width: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthChar;
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in &line.spans {
         if used >= width {
             break;
         }
-        let room = width - used;
-        let text: String = span.content.chars().take(room).collect();
-        used += text.chars().count();
-        spans.push(Span::styled(text, span.style));
+        let mut text = String::new();
+        for c in span.content.chars() {
+            // Cells, not characters: a Hangul syllable or CJK ideograph is one
+            // char and two columns, and budgeting in characters let a clipped
+            // line come back twice as wide as the cell it had to fit.
+            let cells = UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + cells > width {
+                break;
+            }
+            text.push(c);
+            used += cells;
+        }
+        let done = text.chars().count() < span.content.chars().count();
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+        if done {
+            break;
+        }
     }
     Line::from(spans)
 }
@@ -15546,10 +15563,20 @@ fn clip_line(line: &Line<'_>, width: usize) -> Line<'static> {
 /// fault. Wrapping a line whose overflow is real text is the opposite: that
 /// text is otherwise unreachable, since the cell has no horizontal scroll.
 fn overflow_is_decorative(line: &Line<'_>, width: usize) -> bool {
+    use unicode_width::UnicodeWidthChar;
+
+    // Walk by cells, not characters. Skipping `width` *characters* on a line
+    // of wide glyphs stepped past the end of it, so the empty remainder passed
+    // vacuously and a line full of text was clipped as though it were framing.
+    let mut used = 0usize;
     line.spans
         .iter()
         .flat_map(|span| span.content.chars())
-        .skip(width)
+        .filter(|c| {
+            let past = used >= width;
+            used += UnicodeWidthChar::width(*c).unwrap_or(0);
+            past
+        })
         .all(is_decorative)
 }
 
@@ -15567,7 +15594,11 @@ fn collapse_filler(line: &Line<'_>, width: usize) -> Option<Line<'static>> {
         .iter()
         .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
         .collect();
-    let mut excess = cells.len().checked_sub(width)?;
+    // Cells, not characters: the overflow to absorb is measured on screen, and
+    // a line of wide glyphs has half as many characters as it has columns.
+    // Every glyph this function removes is framing or whitespace, which is one
+    // cell each, so the running subtraction below stays in cells.
+    let mut excess = line.width().checked_sub(width)?;
     let framed = is_framed(&cells);
 
     // Runs of one repeated framing glyph, longest first. A run has to be long
@@ -20543,6 +20574,128 @@ mod tests {
         );
     }
 
+    /// Selecting a pane fills the panel with that pane's capture, which should
+    /// break at the panel's full inner width.
+    #[test]
+    fn pane_inspector_capture_wraps_at_its_full_width() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Pane, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let ruler: String = (0..400)
+            .map(|i| {
+                if i % 10 == 0 {
+                    char::from_digit((i / 10) as u32 % 10, 10).unwrap()
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        app.pane_capture = Some(CapturedPane::new("%1".into(), Some("default".into()), ruler));
+        let pane_key = app.topology.sessions[0].windows[0].panes[0].node_key();
+        select_tree_key(&mut app, &pane_key);
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>();
+
+        let ruler_rows: Vec<&String> = rows.iter().filter(|row| row.contains("....")).collect();
+        assert!(!ruler_rows.is_empty(), "capture never rendered:\n{rows:#?}");
+        let used = ruler_rows
+            .iter()
+            .map(|row| {
+                let start = row.find(['0', '.']).unwrap_or(0);
+                row[start..].trim_end().chars().count()
+            })
+            .max()
+            .unwrap_or(0);
+        let inspector_width = 170 - (170 * 30 / 100);
+        assert!(
+            used + 8 >= inspector_width,
+            "wrapped at {used} cells inside a ~{inspector_width}-cell panel:\n{}",
+            ruler_rows
+                .iter()
+                .map(|row| row.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// A lone pane owns the whole mosaic, so its capture should break at the
+    /// cell's full inner width rather than at some narrower budget.
+    #[test]
+    fn lone_mosaic_cell_wraps_at_its_full_width() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Window, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let window_key = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window_key.clone()));
+        // A ruler: every tenth column carries its own digit, so the row text
+        // shows exactly where the break landed.
+        let ruler: String = (0..400)
+            .map(|i| {
+                if i % 10 == 0 {
+                    char::from_digit((i / 10) as u32 % 10, 10).unwrap()
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        app.window_capture = Some(CapturedWindow {
+            key: window_key,
+            zoomed: false,
+            fetched_at: std::time::Instant::now(),
+            panes: vec![CapturedWindowPane {
+                geometry: PaneGeometry {
+                    pane_id: "%1".into(),
+                    pane_index: "0".into(),
+                    left: 0,
+                    top: 0,
+                    width: 100,
+                    height: 20,
+                    active: true,
+                    command: "codex".into(),
+                    alias: None,
+                },
+                text: Some(Text::from(ruler)),
+            }],
+        });
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>();
+
+        let ruler_rows: Vec<&String> = rows.iter().filter(|row| row.contains("....")).collect();
+        assert!(!ruler_rows.is_empty(), "capture never rendered:\n{rows:#?}");
+        // Widest rendered run of the ruler — how many cells the wrap actually
+        // used. Compare against the panel it was drawn into.
+        let used = ruler_rows
+            .iter()
+            .map(|row| {
+                let start = row.find(['0', '.']).unwrap_or(0);
+                row[start..].trim_end().chars().count()
+            })
+            .max()
+            .unwrap_or(0);
+        let inspector_width = 170 - (170 * 30 / 100);
+        assert!(
+            used + 8 >= inspector_width,
+            "wrapped at {used} cells inside a ~{inspector_width}-cell panel:\n{}",
+            ruler_rows
+                .iter()
+                .map(|row| row.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     #[test]
     fn window_inspector_renders_live_capture_in_real_pane_layout() {
         let (agents, panes) = basic_topology_fixture();
@@ -20643,6 +20796,42 @@ mod tests {
             .collect::<String>();
         assert!(boxed.contains("hi"), "prompt text lost: {boxed:?}");
         assert!(boxed.ends_with('│'), "closing border lost: {boxed:?}");
+    }
+
+    /// `width` is display cells, so every measurement against it has to be in
+    /// cells too. Counting characters instead made a wide-glyph line look
+    /// narrower than it is: nothing was left past the "overflow" point, the
+    /// line was judged pure framing, and it got clipped — losing text that had
+    /// nowhere else to go, since the cell has no horizontal scroll.
+    #[test]
+    fn mosaic_measures_wide_glyphs_in_cells_not_characters() {
+        // 19 Hangul syllables: 19 chars, 38 cells.
+        let line = Line::from("가나다라마바사아자차카타파하거너더러머");
+        assert_eq!(line.width(), 38);
+
+        assert!(
+            !overflow_is_decorative(&line, 30),
+            "text past cell 30 was mistaken for framing"
+        );
+
+        let fitted = fit_capture_lines(&Text::from(vec![line]), 30);
+        for row in &fitted.lines {
+            assert!(row.width() <= 30, "row overflows: {}", row.width());
+        }
+        let rejoined = fitted
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert_eq!(rejoined, "가나다라마바사아자차카타파하거너더러머");
+    }
+
+    #[test]
+    fn mosaic_clip_counts_cells() {
+        let line = Line::from("가나다라마");
+        assert_eq!(clip_line(&line, 4).width(), 4);
+        // An odd budget cannot split a 2-cell glyph, so it stops short.
+        assert_eq!(clip_line(&line, 5).width(), 4);
     }
 
     #[test]
