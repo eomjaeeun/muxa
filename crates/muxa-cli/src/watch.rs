@@ -2708,13 +2708,13 @@ enum CollaborationComposeTarget {
     /// collaboration disabled, no room, no peer, or a row outside this
     /// window. `m` still owes the user a way to type at the agent they are
     /// pointing at; what it cannot do is dress those keystrokes up as a
-    /// contract, so `Tab`/`Ctrl-E` explain instead of cycling.
+    /// contract, so `Tab`/`Shift-Tab` explain instead of cycling.
     Prompt { pane: String },
     /// Endpoint-pinned keystrokes composer opened from a topology node.
     PromptTopology { pane: PaneKey },
 }
 
-/// What Ctrl-E cycles: how the composed text leaves the composer.
+/// What Shift-Tab cycles: how the composed text leaves the composer.
 ///
 /// The first two are the wire `WorkMode` contract on a durable request.
 /// `JustSend` is watch-local — plain keystrokes typed into the pane, no
@@ -9722,7 +9722,7 @@ pub(crate) enum Action {
     },
     /// Close the active collaboration composer.
     CancelCollaborationComposer,
-    /// `Tab` / `Ctrl-E` changed the request defaults; persist them next to
+    /// `Tab` / `Shift-Tab` changed the request defaults; persist them next to
     /// the other watch UI preferences.
     CollaborationDefaultsChanged,
     /// `a` — open the headless-question composer.
@@ -11209,7 +11209,7 @@ fn composer_cycle_option(app: &mut App) -> bool {
             mode: ComposeSendMode::JustSend,
             ..
         } => {
-            hint = Some("kind applies to requests — Ctrl-E to leave just-send");
+            hint = Some("kind applies to requests — Shift-Tab to leave just-send");
             None
         }
         CollaborationComposeTarget::Send { kind, mode, .. }
@@ -11253,7 +11253,7 @@ fn composer_cycle_option(app: &mut App) -> bool {
     }
 }
 
-/// Cycle Ctrl-E's delivery mode and remember it for the next composer.
+/// Cycle Shift-Tab's delivery mode and remember it for the next composer.
 fn composer_cycle_mode(app: &mut App) -> bool {
     let changed = match app.collaboration_composer.as_mut().map(|c| &mut c.target) {
         Some(CollaborationComposeTarget::Send { kind, mode, .. }) => {
@@ -12162,7 +12162,7 @@ pub(crate) fn quick_abort_action(app: &App) -> Action {
 /// This used to open an inline prompt first, with an empty second Enter
 /// meaning "attach after all" — a two-step riddle for the most common
 /// action in the TUI. Typing at an agent now lives in the `m` composer,
-/// whose Ctrl-E `just send` mode does what the prompt popup did.
+/// whose Shift-Tab `just send` mode does what the prompt popup did.
 pub(crate) fn quick_prompt_action(app: &App) -> Action {
     if app.uses_tree() {
         return match app.selected_action_pane() {
@@ -13488,7 +13488,7 @@ fn collaboration_composer_title(
                     format!(" → {}  ", composer.label),
                     theme.table_header_style(),
                 ),
-                Span::styled(" Ctrl-E ", theme.key_badge()),
+                Span::styled(" Shift-Tab ", theme.key_badge()),
                 Span::raw("mode "),
             ]),
             Color::Gray,
