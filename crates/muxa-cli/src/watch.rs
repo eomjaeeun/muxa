@@ -170,6 +170,13 @@ pub(crate) struct WatchThemeSpec {
     state_choice: Color,
     state_error: Color,
     state_starting: Color,
+    /// An idle agent whose newest output the operator has not seen.
+    ///
+    /// Its own colour rather than `accent`: accent is spent on chrome the
+    /// eye already knows where to find, and this has to be findable while
+    /// scanning a column of otherwise identical idle markers. The two
+    /// deliberately unhued themes keep their own palette.
+    state_unread: Color,
     pub(crate) border_type: BorderType,
 }
 
@@ -197,12 +204,15 @@ impl WatchThemeSpec {
         Style::default().fg(self.dim)
     }
 
-    /// An idle agent whose latest output the operator has not seen. Accent
-    /// rather than a state colour: this says something about the reader, not
-    /// about the agent, and wearing `state_waiting`'s yellow would read as
+    /// An idle agent whose latest output the operator has not seen.
+    ///
+    /// Deliberately not a state colour: this says something about the reader,
+    /// not about the agent, and wearing `state_waiting`'s yellow would read as
     /// "blocked" on a row that is not.
     pub(crate) fn unread_idle_style(self) -> Style {
-        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.state_unread)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub(crate) fn table_header_style(self) -> Style {
@@ -277,6 +287,7 @@ fn classic_watch_theme() -> WatchThemeSpec {
         state_choice: Color::LightYellow,
         state_error: Color::Red,
         state_starting: Color::Cyan,
+        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
         border_type: BorderType::Plain,
     }
 }
@@ -301,6 +312,7 @@ fn oh_my_muxa_watch_theme() -> WatchThemeSpec {
         state_choice: Color::Rgb(219, 181, 255),
         state_error: Color::Rgb(255, 91, 107),
         state_starting: Color::Rgb(94, 234, 212),
+        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
         border_type: BorderType::Rounded,
     }
 }
@@ -325,6 +337,7 @@ fn focus_watch_theme() -> WatchThemeSpec {
         state_choice: Color::LightYellow,
         state_error: Color::Red,
         state_starting: Color::Cyan,
+        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
         border_type: BorderType::Plain,
     }
 }
@@ -349,6 +362,7 @@ fn ops_watch_theme() -> WatchThemeSpec {
         state_choice: Color::Magenta,
         state_error: Color::LightRed,
         state_starting: Color::LightCyan,
+        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
         border_type: BorderType::Plain,
     }
 }
@@ -373,6 +387,7 @@ fn mono_watch_theme() -> WatchThemeSpec {
         state_choice: Color::White,
         state_error: Color::White,
         state_starting: Color::Gray,
+        state_unread: Color::White,
         border_type: BorderType::Plain,
     }
 }
@@ -397,6 +412,7 @@ fn high_contrast_watch_theme() -> WatchThemeSpec {
         state_choice: Color::LightMagenta,
         state_error: Color::LightRed,
         state_starting: Color::LightBlue,
+        state_unread: Color::LightCyan,
         border_type: BorderType::Rounded,
     }
 }
@@ -421,6 +437,7 @@ fn minimal_watch_theme() -> WatchThemeSpec {
         state_choice: Color::White,
         state_error: Color::White,
         state_starting: Color::White,
+        state_unread: Color::Cyan,
         border_type: BorderType::Plain,
     }
 }
