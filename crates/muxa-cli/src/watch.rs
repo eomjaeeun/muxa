@@ -287,7 +287,7 @@ fn classic_watch_theme() -> WatchThemeSpec {
         state_choice: Color::LightYellow,
         state_error: Color::Red,
         state_starting: Color::Cyan,
-        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        state_unread: Color::Rgb(0xFF, 0x6B, 0x6B),
         border_type: BorderType::Plain,
     }
 }
@@ -312,7 +312,7 @@ fn oh_my_muxa_watch_theme() -> WatchThemeSpec {
         state_choice: Color::Rgb(219, 181, 255),
         state_error: Color::Rgb(255, 91, 107),
         state_starting: Color::Rgb(94, 234, 212),
-        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        state_unread: Color::Rgb(0xFF, 0x6B, 0x6B),
         border_type: BorderType::Rounded,
     }
 }
@@ -337,7 +337,7 @@ fn focus_watch_theme() -> WatchThemeSpec {
         state_choice: Color::LightYellow,
         state_error: Color::Red,
         state_starting: Color::Cyan,
-        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        state_unread: Color::Rgb(0xFF, 0x6B, 0x6B),
         border_type: BorderType::Plain,
     }
 }
@@ -362,7 +362,7 @@ fn ops_watch_theme() -> WatchThemeSpec {
         state_choice: Color::Magenta,
         state_error: Color::LightRed,
         state_starting: Color::LightCyan,
-        state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        state_unread: Color::Rgb(0xFF, 0x6B, 0x6B),
         border_type: BorderType::Plain,
     }
 }
