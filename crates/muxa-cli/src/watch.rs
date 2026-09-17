@@ -2573,6 +2573,12 @@ struct ReadMark {
 
 const READ_MARKS_VERSION: u32 = 1;
 
+/// How many reading positions the file keeps. Generous on purpose: a mark is a
+/// session id and a timestamp, so even a year of daily sessions is a file small
+/// enough to read in one breath, and the cost of evicting one too eagerly is an
+/// agent that wrongly reads as unread.
+const MAX_READ_MARKS: usize = 512;
+
 /// Which agents the operator has already caught up on.
 ///
 /// Every agent lands on `Idle` when its turn ends, and the registry draws no
@@ -2684,12 +2690,36 @@ impl ReadMarks {
         }
     }
 
-    /// Drop marks for agents the registry no longer reports, so a long-lived
-    /// file does not accumulate one entry per session ever seen.
-    fn retain_known(&mut self, live: &HashSet<String>) {
-        let before = self.read_at.len();
-        self.read_at.retain(|session, _| live.contains(session));
-        if self.read_at.len() != before {
+    /// Bound the file without trusting one snapshot's idea of who exists.
+    ///
+    /// This used to drop every mark the snapshot did not name. A snapshot that
+    /// names nobody is not evidence that nobody is there: a refresh that could
+    /// not reach the daemon applies an empty agent list like any other, so a
+    /// daemon restart — or one timed-out round trip — wiped the whole file and
+    /// every agent came back unread the moment the daemon returned. Losing a
+    /// reading position that way is exactly the thing the feature exists to
+    /// prevent.
+    ///
+    /// Absent marks are therefore kept, and the file is bounded by count
+    /// instead: over the cap, the oldest reading positions among the agents
+    /// the snapshot does not report are evicted first. A mark is keyed by
+    /// session id, so one left behind by a session that really did end can
+    /// never match anything again — it costs a few dozen bytes until it ages
+    /// out.
+    fn bound(&mut self, live: &HashSet<String>) {
+        if self.read_at.len() <= MAX_READ_MARKS {
+            return;
+        }
+        let mut absent: Vec<(OffsetDateTime, String)> = self
+            .read_at
+            .iter()
+            .filter(|(session, _)| !live.contains(session.as_str()))
+            .map(|(session, at)| (*at, session.clone()))
+            .collect();
+        absent.sort_unstable();
+        let excess = self.read_at.len() - MAX_READ_MARKS;
+        for (_, session) in absent.into_iter().take(excess) {
+            self.read_at.remove(&session);
             self.dirty = true;
         }
     }
@@ -3664,6 +3694,13 @@ impl App {
             pending_g: false,
             table_page_rows: 10,
             attention_only: false,
+            // Tests must never load — or write — the operator's real reading
+            // positions. An `App` is built dozens of times in this file's
+            // tests and `flush` would overwrite `watch-read.json` with
+            // fixture sessions.
+            #[cfg(test)]
+            read_marks: ReadMarks::load(None),
+            #[cfg(not(test))]
             read_marks: ReadMarks::load(muxa::paths::default_watch_read_file()),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
@@ -5241,8 +5278,9 @@ impl App {
         }
     }
 
-    /// Forget marks for agents the registry no longer reports, so the file
-    /// does not accumulate one entry per session ever seen.
+    /// Keep the read-marks file bounded. Deliberately not "forget everyone the
+    /// snapshot did not name" — see [`ReadMarks::bound`] for why a snapshot is
+    /// not evidence of absence.
     fn prune_read_marks(&mut self) {
         let live: HashSet<String> = self
             .topology
@@ -5253,7 +5291,7 @@ impl App {
             .filter_map(|pane| pane.agent.as_ref())
             .map(|agent| agent.session_id.clone())
             .collect();
-        self.read_marks.retain_known(&live);
+        self.read_marks.bound(&live);
         self.read_marks.flush();
     }
 
@@ -19481,17 +19519,46 @@ mod tests {
 
     /// Marks for agents that have gone away must not accumulate in the file.
     #[test]
-    fn read_marks_are_pruned_to_live_agents() {
+    fn read_marks_survive_a_snapshot_that_names_nobody() {
         let mut marks = ReadMarks::default();
         let now = OffsetDateTime::now_utc();
         marks.mark_read_at("live", now);
-        marks.mark_read_at("gone", now);
+        marks.mark_read_at("quiet", now);
 
-        let live: HashSet<String> = ["live".to_string()].into_iter().collect();
-        marks.retain_known(&live);
+        // What a refresh applies when it could not reach the daemon: an empty
+        // agent list, indistinguishable from "every agent is gone". Dropping
+        // marks here meant a daemon restart — or one timed-out round trip —
+        // brought every agent back unread.
+        marks.bound(&HashSet::new());
 
         assert!(!marks.is_unread_at("live", now));
-        assert!(marks.is_unread_at("gone", now), "dropped mark reads as unread");
+        assert!(!marks.is_unread_at("quiet", now));
+    }
+
+    /// The file still cannot grow without bound: past the cap the oldest
+    /// reading positions go, and only among sessions the snapshot does not
+    /// report — a live agent is never evicted out from under the operator.
+    #[test]
+    fn read_marks_evict_the_oldest_absent_sessions_past_the_cap() {
+        let mut marks = ReadMarks::default();
+        let base = OffsetDateTime::now_utc();
+        for n in 0..u32::try_from(MAX_READ_MARKS + 10).expect("cap fits a u32") {
+            marks.mark_read_at(&format!("s{n:04}"), base + time::Duration::seconds(n.into()));
+        }
+        // The oldest of all, but live, so it must outlast the cap.
+        let live: HashSet<String> = ["s0000".to_string()].into_iter().collect();
+
+        marks.bound(&live);
+
+        assert_eq!(marks.read_at.len(), MAX_READ_MARKS);
+        assert!(
+            !marks.is_unread_at("s0000", base),
+            "a live agent must never be evicted"
+        );
+        assert!(
+            marks.is_unread_at("s0001", base + time::Duration::seconds(1)),
+            "the oldest absent session goes first"
+        );
     }
 
     /// Unread must re-colour the idle marker and change nothing else — no
