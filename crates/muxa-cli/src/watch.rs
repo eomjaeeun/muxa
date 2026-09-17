@@ -9176,6 +9176,15 @@ fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
 /// Ordering follows the room's peer list, which is what the confirmation and
 /// the report both render — one order, so the two always agree.
 fn resolved_marks(app: &App) -> Vec<(String, String)> {
+    // Host scope must resolve marks against the same universe the cursor
+    // resolves against — every tracked pane on the host — not against the
+    // room. A room is one tmux *window*, and a console opened outside tmux
+    // has no room at all, so gating here dropped every mark the operator
+    // made and let `m` fall back to a single-recipient composer without
+    // saying so.
+    if app.collaboration_scope == muxa::config::CollaborationScope::Host {
+        return resolved_marks_on_host(app);
+    }
     let mut resolved = Vec::new();
     let Some(room) = app.collaboration.room.as_ref() else {
         return resolved;
@@ -9194,6 +9203,46 @@ fn resolved_marks(app: &App) -> Vec<(String, String)> {
         }
     }
     resolved
+}
+
+/// Host-scoped mark resolution: canonical window/pane order over the whole
+/// topology, which is the order the table already shows.
+///
+/// A mark carrying an agent session id is only honoured while that session
+/// still owns the pane, so a pane whose agent was replaced is dropped the same
+/// way the room path drops it. Stopped agents are dropped too — there is
+/// nothing left there to answer.
+fn resolved_marks_on_host(app: &App) -> Vec<(String, String)> {
+    app.topology
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .filter_map(|pane| {
+            let agent = pane.agent.as_ref()?;
+            if agent.state == AgentState::Stopped {
+                return None;
+            }
+            let marked = app.collaboration_marks.iter().any(|mark| {
+                mark.pane == pane.key.pane_id
+                    && mark
+                        .agent_session_id
+                        .as_ref()
+                        .is_none_or(|session| *session == agent.session_id)
+            });
+            marked.then(|| {
+                (
+                    pane.key.pane_id.clone(),
+                    format!(
+                        "{}@{} · {}",
+                        agent.kind,
+                        pane.key.pane_id,
+                        topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Marks the room can no longer account for. Shown next to the recipients so a
@@ -9235,6 +9284,17 @@ fn open_watch_collaboration_composer(app: &mut App) {
             label,
         ));
         return;
+    }
+    // Marks that resolve to nobody must not quietly become a single send:
+    // that is exactly how a broadcast silently addressed one agent before.
+    if !app.collaboration_marks.is_empty() {
+        app.set_hint(
+            format!(
+                "{} marked agents are gone — messaging the selected row instead",
+                app.collaboration_marks.len()
+            ),
+            HintLevel::Warn,
+        );
     }
     let (peer_pane, peer_label, pane_key, _) = match collaboration_target_at_cursor(app) {
         Ok(target) => target,
@@ -22951,6 +23011,79 @@ mod tests {
             hint.contains("this row has no live tracked agent"),
             "host-scope hint must be about the row, got {hint:?}"
         );
+    }
+
+    /// A room is one tmux window; host scope is the whole host. Marks on
+    /// agents outside the launch window must still be addressed — resolving
+    /// them against `room.peers` dropped every one of them, and `m` then
+    /// quietly opened a single-recipient composer instead of a broadcast. A
+    /// console opened outside tmux has no room at all, so under host scope
+    /// that made marking useless rather than merely narrow.
+    #[test]
+    fn host_scope_marks_resolve_outside_the_launch_window() {
+        let mut app = collaboration_watch_app();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.set_data(
+            vec![
+                fake_agent(
+                    "self",
+                    Some("%1"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "far",
+                    Some("%913"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "farther",
+                    Some("%42"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![
+                fake_pane("%1", "main", 0, 0, "codex"),
+                fake_pane("%913", "cal-7041", 0, 0, "claude"),
+                fake_pane("%42", "cal-7041", 1, 0, "claude"),
+            ],
+        );
+        for pane in ["%913", "%42", "%404"] {
+            app.collaboration_marks.insert(CollaborationMark {
+                pane: pane.into(),
+                agent_session_id: None,
+            });
+        }
+
+        open_watch_collaboration_composer(&mut app);
+
+        let Some(CollaborationComposeTarget::Broadcast { recipients, .. }) =
+            app.collaboration_composer.as_ref().map(|composer| &composer.target)
+        else {
+            panic!("marked agents outside the room must open a broadcast");
+        };
+        let panes: Vec<_> = recipients
+            .iter()
+            .map(|(pane, _)| pane.as_str())
+            .collect();
+        assert_eq!(panes, ["%913", "%42"]);
+        // The mark on a pane that no longer exists is still counted, so the
+        // confirmation never claims more recipients than it addressed.
+        assert_eq!(stale_mark_count(&app), 1);
     }
 
     #[test]
