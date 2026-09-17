@@ -16820,10 +16820,10 @@ const SWARM_DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦",
 const SWARM_DOTS2: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const SWARM_START: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
-/// Whether the active `[ui] icons` set draws the full unicode decoration —
-/// Geometric Shapes markers, box-drawing branches, the half-circle spinner.
-/// False under both `ascii` (the font lacks them) and `narrow` (the font has
-/// them but sizes them for a double-width cell).
+/// Whether the active `[ui] icons` set draws the optional unicode decoration
+/// gated on this predicate. False under both `ascii` (the font lacks the
+/// glyphs) and `narrow` (the font has them but sizes them for a double-width
+/// cell). The tree's own branch art is not gated here — see `IconSet`.
 fn icons_unicode() -> bool {
     matches!(crate::icon_set(), IconSet::Unicode)
 }

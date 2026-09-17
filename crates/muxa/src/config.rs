@@ -898,9 +898,12 @@ impl Default for UiConfig {
 /// East Asian Ambiguous (`●○▶◆■×`), as are the box-drawing branches, so a
 /// font that sizes them for a double-width cell paints over the column to
 /// their right — a count beside a marker reads as though it overlaps it.
-/// `narrow` takes the `ascii` markers and branches for exactly that reason
-/// while keeping the animated braille spinner, which is East Asian Narrow
-/// and so never substituted for a wide glyph.
+/// `narrow` takes the `ascii` markers for exactly that reason while keeping
+/// the animated braille spinner, which is East Asian Narrow and so never
+/// substituted for a wide glyph. It changes markers only: the box-drawing
+/// branches stay, because a coding font that lacks Geometric Shapes almost
+/// always still has box-drawing, and swapping those too would redraw the
+/// whole tree for a fault most fonts do not have.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IconSet {
