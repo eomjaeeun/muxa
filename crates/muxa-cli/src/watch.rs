@@ -11582,6 +11582,10 @@ fn handle_message_skill_palette_event(
     Action::None
 }
 
+// Key dispatch table: one arm per binding, grown by the Ctrl/Alt editing keys.
+// Splitting it would scatter the composer's keymap across functions and make
+// conflicting arms harder to spot. Same call as `state::mutate_for_event`.
+#[allow(clippy::too_many_lines)]
 fn handle_collaboration_composer_event(
     code: KeyCode,
     modifiers: KeyModifiers,
@@ -15504,7 +15508,7 @@ fn is_frame_glyph(c: char) -> bool {
 fn is_framed(cells: &[(char, Style)]) -> bool {
     let mut visible = cells.iter().map(|&(c, _)| c).filter(|c| !c.is_whitespace());
     let first = visible.next();
-    let last = visible.last().or(first);
+    let last = visible.next_back().or(first);
     first.is_some_and(is_frame_glyph) || last.is_some_and(is_frame_glyph)
 }
 
@@ -15601,6 +15605,10 @@ fn overflow_is_decorative(line: &Line<'_>, width: usize) -> bool {
 /// onto a line of its own; taking the dashes out of the middle costs nothing
 /// anyone was reading.
 fn collapse_filler(line: &Line<'_>, width: usize) -> Option<Line<'static>> {
+    /// A run has to be long enough that shortening it reads as "the rule is
+    /// shorter" rather than as damage.
+    const MIN_RUN: usize = 3;
+
     let cells: Vec<(char, Style)> = line
         .spans
         .iter()
@@ -15613,10 +15621,7 @@ fn collapse_filler(line: &Line<'_>, width: usize) -> Option<Line<'static>> {
     let mut excess = line.width().checked_sub(width)?;
     let framed = is_framed(&cells);
 
-    // Runs of one repeated framing glyph, longest first. A run has to be long
-    // enough that shortening it reads as "the rule is shorter" rather than as
-    // damage.
-    const MIN_RUN: usize = 3;
+    // Runs of one repeated framing glyph, longest first.
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut index = 0;
     while index < cells.len() {
@@ -20625,10 +20630,10 @@ mod tests {
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         app.watch_cfg.spinner = false;
         app.inspector_split = InspectorSplit::InspectorWide;
-        let ruler: String = (0..400)
+        let ruler: String = (0u32..400)
             .map(|i| {
                 if i % 10 == 0 {
-                    char::from_digit((i / 10) as u32 % 10, 10).unwrap()
+                    char::from_digit(i / 10 % 10, 10).unwrap()
                 } else {
                     '.'
                 }
@@ -20679,10 +20684,10 @@ mod tests {
         select_tree_key(&mut app, &TopologyNodeKey::Window(window_key.clone()));
         // A ruler: every tenth column carries its own digit, so the row text
         // shows exactly where the break landed.
-        let ruler: String = (0..400)
+        let ruler: String = (0u32..400)
             .map(|i| {
                 if i % 10 == 0 {
-                    char::from_digit((i / 10) as u32 % 10, 10).unwrap()
+                    char::from_digit(i / 10 % 10, 10).unwrap()
                 } else {
                     '.'
                 }
