@@ -221,11 +221,19 @@ impl WatchThemeSpec {
     /// Deliberately not a state colour: this says something about the reader,
     /// not about the agent, and wearing `state_waiting`'s yellow would read as
     /// "blocked" on a row that is not.
-    /// The `*` a marked row carries beside its name.
+    /// The star a pane carries when the operator marked that pane.
     pub(crate) fn marked_style(self) -> Style {
         Style::default()
             .fg(self.marked)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// The star a session or window carries on behalf of marked panes beneath
+    /// it. Same hue, deliberately quieter: the parent was not chosen, it is
+    /// only reporting, and a row that counts someone else's marks must not
+    /// look like a row the message is going to.
+    pub(crate) fn marked_rollup_style(self) -> Style {
+        Style::default().fg(self.marked).add_modifier(Modifier::DIM)
     }
 
     pub(crate) fn unread_idle_style(self) -> Style {
@@ -2600,6 +2608,12 @@ const READ_MARKS_VERSION: u32 = 1;
 /// enough to read in one breath, and the cost of evicting one too eagerly is an
 /// agent that wrongly reads as unread.
 const MAX_READ_MARKS: usize = 512;
+
+/// What a marked row wears beside its name. U+2726 BLACK FOUR POINTED STAR:
+/// East Asian Neutral, so one cell in every font — unlike every star-shaped
+/// glyph the eye reaches for first (`★` and `☆` are both Ambiguous, and
+/// this terminal's font draws Ambiguous at two cells).
+const MARKED_GLYPH: &str = "✦";
 
 /// Which agents the operator has already caught up on.
 ///
@@ -17372,13 +17386,22 @@ fn tree_node_label(
     } else {
         spans.push(Span::raw(label));
     }
-    // `*` reads as "this row is in the next message". ASCII on purpose: every
-    // marker in this table has to be one cell wide in every font, and the
-    // star glyphs that look the part (`★`, `✱`) are East Asian Wide.
+    // `✦` reads as "this row is in the next message". East Asian Neutral,
+    // so it is one cell wide even under a font that draws Ambiguous glyphs at
+    // two — which rules out the obvious `★`. One space, not two: the
+    // mark belongs to the name it marks.
+    let marked_style = if matches!(node, TopologyNodeRef::Pane(_)) {
+        theme.marked_style()
+    } else {
+        theme.marked_rollup_style()
+    };
     match node_marked_count(node, marked) {
         0 => {}
-        1 => spans.push(Span::styled("  *", theme.marked_style())),
-        count => spans.push(Span::styled(format!("  *{count}"), theme.marked_style())),
+        1 => spans.push(Span::styled(format!(" {MARKED_GLYPH}"), marked_style)),
+        count => spans.push(Span::styled(
+            format!(" {MARKED_GLYPH}{count}"),
+            marked_style,
+        )),
     }
     // A work window that has finished looks exactly like one that stalled —
     // every agent idle — unless the row says so.
@@ -19673,6 +19696,14 @@ mod tests {
         }
         let marked = app.marked_panes();
         assert_eq!(marked.len(), 2);
+        // The whole point of picking this glyph: the operator's font draws
+        // East Asian Ambiguous at two cells, and a two-cell marker here would
+        // paint over the column beside it.
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width_cjk(MARKED_GLYPH),
+            1,
+            "the marked glyph must be one cell even under CJK width rules"
+        );
 
         let theme = watch_theme(WatchTheme::Classic);
         let render = |target: &TreeTarget| {
@@ -19696,8 +19727,27 @@ mod tests {
             .find(|t| matches!(&t.key, TopologyNodeKey::Session(_)))
             .expect("the session has a row");
 
-        assert!(render(pane).ends_with("  *"), "got {:?}", render(pane));
-        assert!(render(parent).ends_with("  *2"), "got {:?}", render(parent));
+        assert!(render(pane).ends_with(" ✦"), "got {:?}", render(pane));
+        // A parent only counts someone else's marks, so its star must not wear
+        // the style that means "this row is a recipient".
+        let star_style = |target: &TreeTarget| {
+            let node = app.topology.find(&target.key).expect("node is live");
+            tree_node_label(target, node, false, &marked, theme)
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.clone())
+                .find(|span| span.content.contains(MARKED_GLYPH))
+                .expect("a marked row has a star span")
+                .style
+        };
+        assert_eq!(star_style(pane), theme.marked_style());
+        assert_eq!(star_style(parent), theme.marked_rollup_style());
+        assert_ne!(theme.marked_style(), theme.marked_rollup_style());
+        assert!(
+            render(parent).ends_with(" ✦2"),
+            "got {:?}",
+            render(parent)
+        );
     }
 
     /// Unread must re-colour the idle marker and change nothing else — no
