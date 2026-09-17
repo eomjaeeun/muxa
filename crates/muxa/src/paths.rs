@@ -15,6 +15,7 @@ pub const ASK_FILENAME: &str = "ask.json";
 pub const NODE_ID_FILENAME: &str = "host-id";
 pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
+pub const WATCH_READ_FILENAME: &str = "watch-read.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -51,6 +52,17 @@ pub fn default_activity_file() -> Option<PathBuf> {
 /// the prompt history so a single backup or rotation policy covers both.
 pub fn default_state_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
+}
+
+/// Where `muxa watch` remembers which agents the operator has already read:
+/// `$XDG_DATA_HOME/muxa/watch-read.json`.
+///
+/// Data, not config: it is a per-operator reading position that changes many
+/// times an hour, so it must not churn `config.toml` the way the persisted
+/// sort and split do. It is also deliberately not daemon state — two people
+/// watching the same host have different unread sets.
+pub fn default_watch_read_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_READ_FILENAME))
 }
 
 /// Stable physical-node identity used by Muxa Fleet. It intentionally lives

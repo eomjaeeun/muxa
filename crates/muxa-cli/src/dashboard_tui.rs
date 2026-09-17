@@ -228,7 +228,7 @@ impl DashboardTheme {
 fn rich_icon(rich: &'static str, ascii: &'static str) -> &'static str {
     match crate::icon_set() {
         IconSet::Unicode => rich,
-        IconSet::Ascii => ascii,
+        IconSet::Narrow | IconSet::Ascii => ascii,
     }
 }
 
@@ -3826,7 +3826,8 @@ fn ratio_bar_spans(
     let empty = width.saturating_sub(filled);
     let (full_cell, empty_cell) = match crate::icon_set() {
         IconSet::Unicode => ("▰", "▱"),
-        IconSet::Ascii => ("#", "-"),
+        // `▰▱` are East Asian Ambiguous like the state markers.
+        IconSet::Narrow | IconSet::Ascii => ("#", "-"),
     };
     vec![
         Span::styled(full_cell.repeat(filled), Style::default().fg(theme.ok)),

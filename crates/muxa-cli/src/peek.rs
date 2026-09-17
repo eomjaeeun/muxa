@@ -1310,14 +1310,14 @@ pub(crate) fn age_stamp(cell: &PeekCell, is_latest_prompt: bool) -> Option<Strin
 fn glyph_prompt() -> &'static str {
     match crate::icon_set() {
         IconSet::Unicode => "▸ ",
-        IconSet::Ascii => "> ",
+        IconSet::Narrow | IconSet::Ascii => "> ",
     }
 }
 
 fn glyph_response() -> &'static str {
     match crate::icon_set() {
         IconSet::Unicode => "◂ ",
-        IconSet::Ascii => "< ",
+        IconSet::Narrow | IconSet::Ascii => "< ",
     }
 }
 

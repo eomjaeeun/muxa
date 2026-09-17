@@ -3602,7 +3602,10 @@ pub(crate) fn icon_set() -> IconSet {
 pub(crate) fn state_icon(state: AgentState) -> &'static str {
     match icon_set() {
         IconSet::Unicode => state_icon_unicode(state),
-        IconSet::Ascii => state_icon_ascii(state),
+        // `narrow` differs from `ascii` only in keeping the spinner; the
+        // static markers are the same, and for the same reason — no glyph
+        // here may be one a font might draw two cells wide.
+        IconSet::Narrow | IconSet::Ascii => state_icon_ascii(state),
     }
 }
 
@@ -5242,6 +5245,25 @@ mod tests {
         for state in ALL_STATES {
             assert_eq!(UnicodeWidthStr::width(state_icon(state)), 1);
         }
+    }
+
+    /// `narrow` and `ascii` exist for fonts that draw East Asian Ambiguous
+    /// glyphs two cells wide, so every glyph those sets can emit — in the
+    /// watch table and in the tmux status line, which share `state_icon` —
+    /// must measure one cell under CJK width rules as well as default ones.
+    /// `unicode` is exempt by definition: it is the set that accepts them.
+    #[test]
+    fn narrow_and_ascii_icons_survive_cjk_width_rules() {
+        for state in ALL_STATES {
+            let glyph = state_icon_ascii(state);
+            assert_eq!(
+                UnicodeWidthStr::width_cjk(glyph),
+                1,
+                "{glyph:?} widens under CJK rules"
+            );
+        }
+        // The tmux attention segment rides the same status line.
+        assert_eq!(UnicodeWidthStr::width_cjk("\u{26A0}"), 1);
     }
 
     #[test]

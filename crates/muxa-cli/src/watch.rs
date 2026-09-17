@@ -197,6 +197,14 @@ impl WatchThemeSpec {
         Style::default().fg(self.dim)
     }
 
+    /// An idle agent whose latest output the operator has not seen. Accent
+    /// rather than a state colour: this says something about the reader, not
+    /// about the agent, and wearing `state_waiting`'s yellow would read as
+    /// "blocked" on a row that is not.
+    pub(crate) fn unread_idle_style(self) -> Style {
+        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+    }
+
     pub(crate) fn table_header_style(self) -> Style {
         Style::default()
             .fg(self.table_header)
@@ -1901,10 +1909,10 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  o / Alt-P      open preview overlay",
         "  Alt-I / Alt-E  inspector / persistent event inbox",
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
-        "  Alt-A          attention-only filter",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M / Space  message selected or marked / mailbox / mark agent",
+        "  u / U · Alt-A  unread on row / all read · attention-only filter",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -1915,7 +1923,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
             IconSet::Unicode => {
                 "  ● working  ▶ input  ◆ choice  ■ error  ○ idle  ◌ starting  × stopped"
             }
-            IconSet::Ascii => {
+            IconSet::Narrow | IconSet::Ascii => {
                 "  * working  > input  ? choice  ! error  o idle  ~ starting  x stopped"
             }
         },
@@ -2527,6 +2535,145 @@ fn persist_watch_collab_layout(
     std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+/// On-disk shape of the read marks. Versioned so a later format change can
+/// recognise and discard this one instead of silently mis-reading it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ReadMarksFile {
+    version: u32,
+    #[serde(default)]
+    marks: HashMap<String, ReadMark>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct ReadMark {
+    #[serde(with = "time::serde::rfc3339")]
+    at: OffsetDateTime,
+}
+
+const READ_MARKS_VERSION: u32 = 1;
+
+/// Which agents the operator has already caught up on.
+///
+/// Every agent lands on `Idle` when its turn ends, and the registry draws no
+/// distinction between "idle, and I read the answer" and "idle, and I have not
+/// looked yet". Running a dozen agents that means opening panes just to find
+/// out whether anything changed in them — the thing this is here to stop.
+///
+/// A mark stores the agent's `last_activity_at` as of the moment it was read,
+/// not a boolean. Anything the agent does afterwards — finishing another turn,
+/// above all — pushes `last_activity_at` past the mark and the row goes unread
+/// again on its own. An agent with no mark has never been read.
+#[derive(Debug, Default)]
+pub(crate) struct ReadMarks {
+    /// `None` when the data directory is unavailable. Marks then live for the
+    /// process only and nothing is ever written.
+    path: Option<PathBuf>,
+    read_at: HashMap<String, OffsetDateTime>,
+    /// Set by every mutation, cleared by [`ReadMarks::flush`]. Keeps the
+    /// 16 ms input loop from rewriting the file on frames that changed nothing.
+    dirty: bool,
+}
+
+impl ReadMarks {
+    fn load(path: Option<PathBuf>) -> Self {
+        let read_at = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<ReadMarksFile>(&text).ok())
+            .filter(|file| file.version == READ_MARKS_VERSION)
+            .map(|file| {
+                file.marks
+                    .into_iter()
+                    .map(|(session, mark)| (session, mark.at))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            path,
+            read_at,
+            dirty: false,
+        }
+    }
+
+    /// Write the marks back, at most once per changed frame. Failures are
+    /// swallowed: losing a reading position is not worth interrupting the TUI,
+    /// and the next mutation retries anyway.
+    fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let file = ReadMarksFile {
+            version: READ_MARKS_VERSION,
+            marks: self
+                .read_at
+                .iter()
+                .map(|(session, at)| (session.clone(), ReadMark { at: *at }))
+                .collect(),
+        };
+        let Ok(text) = serde_json::to_string(&file) else {
+            return;
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        if std::fs::write(path, text).is_err() {
+            return;
+        }
+        // Reading positions say which conversations the operator is following;
+        // same 0600 the rest of muxa's data files carry.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    fn is_unread_at(&self, session: &str, activity: OffsetDateTime) -> bool {
+        self.read_at
+            .get(session)
+            .is_none_or(|read_at| activity > *read_at)
+    }
+
+    fn is_unread(&self, agent: &Agent) -> bool {
+        self.is_unread_at(&agent.session_id, agent.last_activity_at)
+    }
+
+    /// Advance the mark to `activity`. Never moves it backwards: a stale
+    /// snapshot arriving after a newer one must not resurrect an unread row.
+    fn mark_read_at(&mut self, session: &str, activity: OffsetDateTime) {
+        match self.read_at.get_mut(session) {
+            Some(read_at) if *read_at >= activity => return,
+            Some(read_at) => *read_at = activity,
+            None => {
+                self.read_at.insert(session.to_string(), activity);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn mark_unread_at(&mut self, session: &str) {
+        if self.read_at.remove(session).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Drop marks for agents the registry no longer reports, so a long-lived
+    /// file does not accumulate one entry per session ever seen.
+    fn retain_known(&mut self, live: &HashSet<String>) {
+        let before = self.read_at.len();
+        self.read_at.retain(|session, _| live.contains(session));
+        if self.read_at.len() != before {
+            self.dirty = true;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -3103,6 +3250,9 @@ pub(crate) struct App {
     table_page_rows: usize,
     /// When true, only error / input / choice targets remain visible.
     pub attention_only: bool,
+    /// Which agents the operator has already caught up on. Survives restarts;
+    /// see [`ReadMarks`].
+    read_marks: ReadMarks,
     /// Explicitly expanded session/window keys. Pane keys are leaves and never
     /// enter this set. Keys survive refresh and sort because they include the
     /// complete host+socket ancestry.
@@ -3493,6 +3643,7 @@ impl App {
             pending_g: false,
             table_page_rows: 10,
             attention_only: false,
+            read_marks: ReadMarks::load(muxa::paths::default_watch_read_file()),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
             filtered_selection_anchor: None,
@@ -3695,6 +3846,7 @@ impl App {
         // This retains paneless/ambiguous agents in `unassigned_agents` and
         // gives every tree action a collision-free target.
         self.topology = build_watch_topology(&agents, &panes, &sessions, &self.pipeline_runs);
+        self.prune_read_marks();
         self.reconcile_tree_expansion(&previous_topology_keys);
 
         // Filter out paneless agents up front when the user has opted in
@@ -5020,6 +5172,110 @@ impl App {
             Some(TopologyNodeRef::Pane(pane)) => vec![pane],
             None => Vec::new(),
         }
+    }
+
+    /// Session ids of every agent the operator has not caught up on.
+    ///
+    /// Materialised once per frame: the row renderers walk `self.topology`
+    /// and need the answer per row, and an owned set lets them do that
+    /// without a second borrow of `self`.
+    fn unread_sessions(&self) -> HashSet<String> {
+        self.topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .filter_map(|pane| pane.agent.as_ref())
+            .filter(|agent| self.read_marks.is_unread(agent))
+            .map(|agent| agent.session_id.clone())
+            .collect()
+    }
+
+    /// `(session id, last activity)` for every agent under the cursor. A
+    /// session or window row covers everything beneath it, so one keypress
+    /// clears a whole window the operator has just skimmed.
+    fn selected_read_targets(&self) -> Vec<(String, OffsetDateTime)> {
+        self.selected_topology_panes()
+            .into_iter()
+            .filter_map(|pane| pane.agent.as_ref())
+            .map(|agent| (agent.session_id.clone(), agent.last_activity_at))
+            .collect()
+    }
+
+    /// Mark one pane's agent read by pane id, for callers whose target is
+    /// pinned independently of the cursor.
+    fn mark_pane_read(&mut self, pane_id: &str) {
+        let target = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .find(|pane| pane.key.pane_id == pane_id)
+            .and_then(|pane| pane.agent.as_ref())
+            .map(|agent| (agent.session_id.clone(), agent.last_activity_at));
+        if let Some((session, activity)) = target {
+            self.read_marks.mark_read_at(&session, activity);
+            self.read_marks.flush();
+        }
+    }
+
+    /// Forget marks for agents the registry no longer reports, so the file
+    /// does not accumulate one entry per session ever seen.
+    fn prune_read_marks(&mut self) {
+        let live: HashSet<String> = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .filter_map(|pane| pane.agent.as_ref())
+            .map(|agent| agent.session_id.clone())
+            .collect();
+        self.read_marks.retain_known(&live);
+        self.read_marks.flush();
+    }
+
+    /// `u` — flip the cursor row. Mixed selections (some read, some not)
+    /// resolve to "mark all read": the operator pressing `u` on a window
+    /// showing unread wants the unread gone, not inverted.
+    fn toggle_selected_read(&mut self) -> Option<String> {
+        let targets = self.selected_read_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        let any_unread = targets
+            .iter()
+            .any(|(session, activity)| self.read_marks.is_unread_at(session, *activity));
+        for (session, activity) in &targets {
+            if any_unread {
+                self.read_marks.mark_read_at(session, *activity);
+            } else {
+                self.read_marks.mark_unread_at(session);
+            }
+        }
+        self.read_marks.flush();
+        let verb = if any_unread { "read" } else { "unread" };
+        Some(format!("marked {} {verb}", targets.len()))
+    }
+
+    /// `U` — clear the whole board.
+    fn mark_all_read(&mut self) -> usize {
+        let targets: Vec<(String, OffsetDateTime)> = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .filter_map(|pane| pane.agent.as_ref())
+            .filter(|agent| self.read_marks.is_unread(agent))
+            .map(|agent| (agent.session_id.clone(), agent.last_activity_at))
+            .collect();
+        for (session, activity) in &targets {
+            self.read_marks.mark_read_at(session, *activity);
+        }
+        self.read_marks.flush();
+        targets.len()
     }
 
     fn selected_target(&self) -> Option<VisibleTarget> {
@@ -6419,7 +6675,7 @@ fn state_summary_spans(
     theme: WatchThemeSpec,
     spin: Spinner,
 ) -> Vec<Span<'static>> {
-    state_summary_parts(states, theme, spin)
+    state_summary_parts(states, false, theme, spin)
         .into_iter()
         .enumerate()
         .flat_map(|(i, part)| {
@@ -6433,8 +6689,17 @@ fn state_summary_spans(
         .collect()
 }
 
+/// Build the per-state markers for one row's gutter.
+///
+/// `unread_idle` re-colours the idle marker and nothing else. Every other
+/// state already announces itself — `WaitingInput` and `WaitingChoice` are
+/// yellow, `Error` red — so "there is output here I have not read" only ever
+/// needs saying about a row that has gone quiet. Re-using the existing idle
+/// glyph in another colour also keeps the gutter exactly as wide as it was,
+/// which a marker of its own could not.
 fn state_summary_parts(
     states: impl IntoIterator<Item = AgentState>,
+    unread_idle: bool,
     theme: WatchThemeSpec,
     spin: Spinner,
 ) -> Vec<StateSummaryPart> {
@@ -6446,7 +6711,10 @@ fn state_summary_parts(
         if count == 0 {
             continue;
         }
-        let (symbol, style) = state_marker(state, theme, spin);
+        let (symbol, mut style) = state_marker(state, theme, spin);
+        if unread_idle && state == AgentState::Idle {
+            style = theme.unread_idle_style();
+        }
         let label = if count == 1 {
             symbol.to_string()
         } else {
@@ -6482,10 +6750,11 @@ fn overflow_label(count: usize, max_width: usize) -> String {
 
 fn state_summary_gutter_spans(
     states: impl IntoIterator<Item = AgentState>,
+    unread_idle: bool,
     theme: WatchThemeSpec,
     spin: Spinner,
 ) -> Vec<Span<'static>> {
-    let parts = state_summary_parts(states, theme, spin);
+    let parts = state_summary_parts(states, unread_idle, theme, spin);
     let fitted = if state_summary_parts_width(&parts) <= WORK_STATE_GUTTER_CONTENT_WIDTH {
         parts
     } else {
@@ -6687,7 +6956,8 @@ fn state_summary_spans_from_parts(parts: &[StateSummaryPart]) -> Vec<Span<'stati
 }
 
 fn work_label(s: &WorkRow, theme: WatchThemeSpec, spin: Spinner) -> Text<'static> {
-    let mut spans = state_summary_gutter_spans(s.agent_states.values().copied(), theme, spin);
+    let mut spans =
+        state_summary_gutter_spans(s.agent_states.values().copied(), false, theme, spin);
     spans.push(Span::raw(s.display_name.clone()));
     if let Some((done, total)) = s.completion {
         // Complete reads as a finished thing, not as another dim detail: this
@@ -7804,12 +8074,17 @@ pub async fn run(
                     quit = true;
                     break;
                 }
+                // Going to the pane is reading it — the whole point of the
+                // marker is to stop the operator opening panes to find out
+                // whether anything changed, so arriving must clear it.
                 Action::AttachPane(pane) => {
+                    app.mark_pane_read(&pane);
                     jump_target = Some(WatchOpenTarget::LegacyPane(pane));
                     quit = true;
                     break;
                 }
                 Action::AttachTopologyPane(pane) => {
+                    app.mark_pane_read(&pane.pane_id);
                     jump_target = Some(WatchOpenTarget::TopologyPane(pane));
                     quit = true;
                     break;
@@ -8141,6 +8416,14 @@ pub async fn run(
                                 .collect();
                             app.collaboration_marks
                                 .retain(|mark| !delivered.contains(mark.pane.as_str()));
+                            // Answering an agent is the other way of dealing
+                            // with it. A failed delivery leaves the row unread
+                            // so the retry is still visible.
+                            let read: Vec<String> =
+                                delivered.iter().map(|pane| (*pane).to_string()).collect();
+                            for pane in read {
+                                app.mark_pane_read(&pane);
+                            }
                         }
                         app.broadcast_report = report;
                         apply_outcome_to_app(&mut app, outcome);
@@ -10344,6 +10627,28 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             if app.browse_keys_active() && !modifiers.contains(KeyModifiers::CONTROL) =>
         {
             Action::OpenCollaborationMailbox
+        }
+        // Reading position, not agent state. `u` flips the row under the
+        // cursor — a session or window row covers every agent beneath it —
+        // and `U` clears the board. Both exclude Ctrl and Alt, which carry
+        // half-page movement and search editing on the same letter.
+        KeyCode::Char('u')
+            if app.browse_keys_active()
+                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            match app.toggle_selected_read() {
+                Some(message) => app.set_hint(message, HintLevel::Ok),
+                None => app.set_hint("no agent on this row", HintLevel::Warn),
+            }
+            Action::None
+        }
+        KeyCode::Char('U')
+            if app.browse_keys_active()
+                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let cleared = app.mark_all_read();
+            app.set_hint(format!("marked {cleared} read"), HintLevel::Ok);
+            Action::None
         }
         KeyCode::Char('n') if app.browse_keys_active() => {
             let fallback_dir =
@@ -14779,7 +15084,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
     let agent_total = agent_states.len();
     let spin = Spinner {
         frame: app.anim_frame,
-        enabled: app.watch_cfg.spinner && icons_unicode(),
+        enabled: app.watch_cfg.spinner && spinner_supported(),
     };
     let state_summary = header_state_summary_spans(agent_states, theme, spin);
 
@@ -15134,7 +15439,7 @@ fn topology_inspector_status_line(
             theme,
             Spinner {
                 frame: app.anim_frame,
-                enabled: app.watch_cfg.spinner && icons_unicode(),
+                enabled: app.watch_cfg.spinner && spinner_supported(),
             },
         ));
     }
@@ -16088,7 +16393,7 @@ fn render_topology_inspector(
     let width = usize::from(area.width.saturating_sub(2)).max(1);
     let spin = Spinner {
         frame: app.anim_frame,
-        enabled: app.watch_cfg.spinner && icons_unicode(),
+        enabled: app.watch_cfg.spinner && spinner_supported(),
     };
     let (title, mut lines) = match node {
         TopologyNodeRef::Session(session) => {
@@ -16515,27 +16820,37 @@ const SWARM_DOTS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦",
 const SWARM_DOTS2: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const SWARM_START: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
-/// Whether the active `[ui] icons` set can render the braille/half-circle
-/// spinner. Under `icons = "ascii"` the spinner is suppressed so a terminal
-/// that can't draw unicode doesn't get mojibake — it falls back to the static
-/// ascii `state_icon`.
+/// Whether the active `[ui] icons` set draws the full unicode decoration —
+/// Geometric Shapes markers, box-drawing branches, the half-circle spinner.
+/// False under both `ascii` (the font lacks them) and `narrow` (the font has
+/// them but sizes them for a double-width cell).
 fn icons_unicode() -> bool {
     matches!(crate::icon_set(), IconSet::Unicode)
 }
 
+/// Whether the animated braille spinner may run. Separate from
+/// [`icons_unicode`] because braille is the one animated set that is East
+/// Asian Narrow throughout: `narrow` drops every ambiguous glyph but keeps
+/// this. Only `ascii`, which assumes the font has no box-drawing at all,
+/// falls back to the static marker.
+fn spinner_supported() -> bool {
+    matches!(crate::icon_set(), IconSet::Unicode | IconSet::Narrow)
+}
+
 fn swarm_glyph(state: AgentState, frame: usize) -> &'static str {
-    if !icons_unicode() {
-        return crate::state_icon(state);
-    }
-    match state {
-        AgentState::Working => SWARM_DOTS[frame % SWARM_DOTS.len()],
-        AgentState::Starting => SWARM_START[frame % SWARM_START.len()],
-        other => crate::state_icon(other),
+    match (crate::icon_set(), state) {
+        (IconSet::Ascii, _) => crate::state_icon(state),
+        (_, AgentState::Working) => SWARM_DOTS[frame % SWARM_DOTS.len()],
+        // `◐◓◑◒` mixes Ambiguous (`◐◑`) and Narrow (`◓◒`) frames, so on a font
+        // that draws ambiguous glyphs wide the marker would change width twice
+        // per rotation and jitter the column. Only full `unicode` runs it.
+        (IconSet::Unicode, AgentState::Starting) => SWARM_START[frame % SWARM_START.len()],
+        (_, other) => crate::state_icon(other),
     }
 }
 
 fn subagent_glyph(frame: usize, phase: usize) -> &'static str {
-    if !icons_unicode() {
+    if !spinner_supported() {
         return crate::state_icon(AgentState::Working);
     }
     SWARM_DOTS2[frame.wrapping_add(phase) % SWARM_DOTS2.len()]
@@ -16798,9 +17113,31 @@ fn target_window<'a>(target: &TreeTarget, node: TopologyNodeRef<'a>) -> Option<&
     }
 }
 
+/// Does this node hold an idle agent the operator has not caught up on?
+///
+/// Idle only. A `Working` row is already moving and the attention states are
+/// already coloured for it; the gap this fills is the agent that finished,
+/// went quiet, and now looks exactly like the eleven beside it.
+fn node_has_unread_idle(node: TopologyNodeRef<'_>, unread: &HashSet<String>) -> bool {
+    match node {
+        TopologyNodeRef::Pane(pane) => pane.agent.as_ref().is_some_and(|agent| {
+            agent.state == AgentState::Idle && unread.contains(&agent.session_id)
+        }),
+        TopologyNodeRef::Window(window) => window
+            .panes
+            .iter()
+            .any(|pane| node_has_unread_idle(TopologyNodeRef::Pane(pane), unread)),
+        TopologyNodeRef::Session(session) => session
+            .windows
+            .iter()
+            .any(|window| node_has_unread_idle(TopologyNodeRef::Window(window), unread)),
+    }
+}
+
 fn tree_state_cell(
     target: &TreeTarget,
     node: TopologyNodeRef<'_>,
+    unread: &HashSet<String>,
     theme: WatchThemeSpec,
     spin: Spinner,
 ) -> Text<'static> {
@@ -16815,9 +17152,14 @@ fn tree_state_cell(
     }
     let states = tree_node_states(node);
     if states.is_empty() {
-        return Text::from(Span::styled("○", theme.dim_style()));
+        return Text::from(Span::styled(crate::state_icon(AgentState::Idle), theme.dim_style()));
     }
-    Text::from(Line::from(state_summary_gutter_spans(states, theme, spin)))
+    Text::from(Line::from(state_summary_gutter_spans(
+        states,
+        node_has_unread_idle(node, unread),
+        theme,
+        spin,
+    )))
 }
 
 fn tree_state_is_redundant(target: &TreeTarget, node: TopologyNodeRef<'_>) -> bool {
@@ -17255,7 +17597,7 @@ fn render_work_table(f: &mut Frame, area: Rect, app: &mut App, targets: &[TreeTa
         Row::new(columns.iter().map(|column| column.header())).style(theme.table_header_style());
     let spin = Spinner {
         frame: app.anim_frame,
-        enabled: app.watch_cfg.spinner && icons_unicode(),
+        enabled: app.watch_cfg.spinner && spinner_supported(),
     };
     let workspace_names: HashMap<_, _> = app
         .topology
@@ -17274,7 +17616,7 @@ fn render_work_table(f: &mut Frame, area: Rect, app: &mut App, targets: &[TreeTa
                 .iter()
                 .map(|column| match column {
                     WorkTableColumn::State => {
-                        Cell::from(tree_state_cell(target, node, theme, spin))
+                        Cell::from(tree_state_cell(target, node, &HashSet::new(), theme, spin))
                     }
                     WorkTableColumn::Work => Cell::from(window.name.clone()),
                     WorkTableColumn::Workspace => Cell::from(
@@ -17375,7 +17717,7 @@ fn render_topology_table(
     let now = OffsetDateTime::now_utc();
     let spin = Spinner {
         frame: app.anim_frame,
-        enabled: app.watch_cfg.spinner && icons_unicode(),
+        enabled: app.watch_cfg.spinner && spinner_supported(),
     };
     let endpoint_count = app
         .topology
@@ -17384,6 +17726,7 @@ fn render_topology_table(
         .map(|session| &session.key.endpoint)
         .collect::<HashSet<_>>()
         .len();
+    let unread = app.unread_sessions();
     let rows: Vec<Row> = targets
         .iter()
         .filter_map(|target| {
@@ -17392,7 +17735,7 @@ fn render_topology_table(
                 .iter()
                 .map(|column| match column {
                     TopologyTableColumn::State => {
-                        Cell::from(tree_state_cell(target, node, theme, spin))
+                        Cell::from(tree_state_cell(target, node, &unread, theme, spin))
                     }
                     TopologyTableColumn::Node => {
                         Cell::from(tree_node_label(target, node, endpoint_count > 1, theme))
@@ -17488,7 +17831,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let status_host = status_host_column(&columns);
     let spin = Spinner {
         frame: app.anim_frame,
-        enabled: app.watch_cfg.spinner && icons_unicode(),
+        enabled: app.watch_cfg.spinner && spinner_supported(),
     };
     // A one-shot done/error flash overrides the State cell for its window.
     // Resolve per-row pulses up front so the row closure only touches app
@@ -19078,6 +19421,92 @@ mod tests {
         );
     }
 
+    /// The marker exists so a board of idle agents still says which of them
+    /// have produced something since the operator last looked.
+    #[test]
+    fn unread_tracks_activity_against_the_read_mark() {
+        let mut marks = ReadMarks::default();
+        let mut agent = fake_agent(
+            "s",
+            Some("%1"),
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            Some("rebuild the fuzzer image"),
+            None,
+            None,
+            None,
+        );
+
+        // Never read: unread.
+        assert!(marks.is_unread(&agent));
+
+        marks.mark_read_at(&agent.session_id, agent.last_activity_at);
+        assert!(!marks.is_unread(&agent));
+
+        // The agent finishes another turn.
+        agent.last_activity_at += time::Duration::seconds(1);
+        assert!(marks.is_unread(&agent), "new activity must resurface the row");
+
+        marks.mark_read_at(&agent.session_id, agent.last_activity_at);
+        assert!(!marks.is_unread(&agent));
+
+        // A stale snapshot must not drag the mark backwards and un-read it.
+        marks.mark_read_at(&agent.session_id, agent.last_activity_at - time::Duration::seconds(30));
+        assert!(!marks.is_unread(&agent));
+
+        marks.mark_unread_at(&agent.session_id);
+        assert!(marks.is_unread(&agent));
+    }
+
+    /// Marks for agents that have gone away must not accumulate in the file.
+    #[test]
+    fn read_marks_are_pruned_to_live_agents() {
+        let mut marks = ReadMarks::default();
+        let now = OffsetDateTime::now_utc();
+        marks.mark_read_at("live", now);
+        marks.mark_read_at("gone", now);
+
+        let live: HashSet<String> = ["live".to_string()].into_iter().collect();
+        marks.retain_known(&live);
+
+        assert!(!marks.is_unread_at("live", now));
+        assert!(marks.is_unread_at("gone", now), "dropped mark reads as unread");
+    }
+
+    /// Unread must re-colour the idle marker and change nothing else — no
+    /// extra glyph, no extra column, and never a state that already stands
+    /// out on its own.
+    #[test]
+    fn unread_recolours_only_the_idle_marker() {
+        let theme = watch_theme(WatchTheme::Classic);
+        let spin = Spinner::OFF;
+
+        let read = state_summary_parts([AgentState::Idle], false, theme, spin);
+        let unread = state_summary_parts([AgentState::Idle], true, theme, spin);
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read[0].label, unread[0].label,
+            "the glyph itself must not change — the gutter stays as wide as it was"
+        );
+        assert_ne!(read[0].style, unread[0].style, "unread idle must re-colour");
+        assert_eq!(unread[0].style, theme.unread_idle_style());
+
+        // Waiting and error rows are already loud; leave them alone.
+        for state in [
+            AgentState::WaitingInput,
+            AgentState::WaitingChoice,
+            AgentState::Error,
+            AgentState::Working,
+        ] {
+            let plain = state_summary_parts([state], false, theme, spin);
+            let flagged = state_summary_parts([state], true, theme, spin);
+            assert_eq!(
+                plain[0].style, flagged[0].style,
+                "{state:?} must not change colour for unread"
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn fake_agent(
         session: &str,
@@ -19957,7 +20386,7 @@ mod tests {
             .iter()
             .map(|target| {
                 let node = app.topology.find(&target.key).unwrap();
-                tree_state_cell(target, node, theme, Spinner::OFF)
+                tree_state_cell(target, node, &HashSet::new(), theme, Spinner::OFF)
             })
             .collect::<Vec<_>>();
         assert!(state_cells[0].lines.is_empty());
@@ -29180,7 +29609,7 @@ sort = ["state"]
             body.contains("↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise")
         );
         assert!(body.contains(":              command palette"));
-        assert!(body.contains("Alt-A          attention-only filter"));
+        assert!(body.contains("u / U · Alt-A  unread on row / all read · attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));

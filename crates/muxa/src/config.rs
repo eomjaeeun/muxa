@@ -892,11 +892,21 @@ impl Default for UiConfig {
 /// present in virtually every monospace font. `ascii` falls back to single
 /// `[char]` markers for terminals whose primary font lacks those codepoints
 /// and would otherwise borrow a mismatched-size glyph from a fallback font.
+///
+/// `narrow` sits between them, for the commoner problem: the font *has* the
+/// Geometric Shapes but draws them too wide. Six of the seven markers are
+/// East Asian Ambiguous (`●○▶◆■×`), as are the box-drawing branches, so a
+/// font that sizes them for a double-width cell paints over the column to
+/// their right — a count beside a marker reads as though it overlaps it.
+/// `narrow` takes the `ascii` markers and branches for exactly that reason
+/// while keeping the animated braille spinner, which is East Asian Narrow
+/// and so never substituted for a wide glyph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IconSet {
     #[default]
     Unicode,
+    Narrow,
     Ascii,
 }
 
