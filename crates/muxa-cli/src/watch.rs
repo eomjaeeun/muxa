@@ -181,6 +181,14 @@ pub(crate) struct WatchThemeSpec {
     /// unread marker wearing any of them reads as a state the agent is not
     /// in. The two deliberately unhued themes keep their own palette.
     state_unread: Color,
+    /// A row the operator marked with `Space` as a recipient for the next
+    /// message.
+    ///
+    /// Magenta in the hued themes — the one hue left once green, yellow and
+    /// red are agent states and blue is unread. A mark is the operator's own
+    /// selection rather than anything the agent is doing, so it must not read
+    /// as a state it could be confused with.
+    marked: Color,
     pub(crate) border_type: BorderType,
 }
 
@@ -213,6 +221,13 @@ impl WatchThemeSpec {
     /// Deliberately not a state colour: this says something about the reader,
     /// not about the agent, and wearing `state_waiting`'s yellow would read as
     /// "blocked" on a row that is not.
+    /// The `*` a marked row carries beside its name.
+    pub(crate) fn marked_style(self) -> Style {
+        Style::default()
+            .fg(self.marked)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub(crate) fn unread_idle_style(self) -> Style {
         Style::default()
             .fg(self.state_unread)
@@ -292,6 +307,7 @@ fn classic_watch_theme() -> WatchThemeSpec {
         state_error: Color::Red,
         state_starting: Color::Cyan,
         state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        marked: Color::Rgb(0xFF, 0x87, 0xD7),
         border_type: BorderType::Plain,
     }
 }
@@ -317,6 +333,7 @@ fn oh_my_muxa_watch_theme() -> WatchThemeSpec {
         state_error: Color::Rgb(255, 91, 107),
         state_starting: Color::Rgb(94, 234, 212),
         state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        marked: Color::Rgb(0xFF, 0x87, 0xD7),
         border_type: BorderType::Rounded,
     }
 }
@@ -342,6 +359,7 @@ fn focus_watch_theme() -> WatchThemeSpec {
         state_error: Color::Red,
         state_starting: Color::Cyan,
         state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        marked: Color::Rgb(0xFF, 0x87, 0xD7),
         border_type: BorderType::Plain,
     }
 }
@@ -367,6 +385,7 @@ fn ops_watch_theme() -> WatchThemeSpec {
         state_error: Color::LightRed,
         state_starting: Color::LightCyan,
         state_unread: Color::Rgb(0x5F, 0xAF, 0xFF),
+        marked: Color::Rgb(0xFF, 0x87, 0xD7),
         border_type: BorderType::Plain,
     }
 }
@@ -392,6 +411,7 @@ fn mono_watch_theme() -> WatchThemeSpec {
         state_error: Color::White,
         state_starting: Color::Gray,
         state_unread: Color::White,
+        marked: Color::White,
         border_type: BorderType::Plain,
     }
 }
@@ -417,6 +437,7 @@ fn high_contrast_watch_theme() -> WatchThemeSpec {
         state_error: Color::LightRed,
         state_starting: Color::LightBlue,
         state_unread: Color::LightCyan,
+        marked: Color::LightMagenta,
         border_type: BorderType::Rounded,
     }
 }
@@ -442,6 +463,7 @@ fn minimal_watch_theme() -> WatchThemeSpec {
         state_error: Color::White,
         state_starting: Color::White,
         state_unread: Color::Cyan,
+        marked: Color::Magenta,
         border_type: BorderType::Plain,
     }
 }
@@ -5246,6 +5268,16 @@ impl App {
             .filter_map(|pane| pane.agent.as_ref())
             .filter(|agent| self.read_marks.is_unread(agent))
             .map(|agent| agent.session_id.clone())
+            .collect()
+    }
+
+    /// Pane ids the operator has marked as recipients, resolved the same way
+    /// the composer resolves them — so what the roster stars is exactly what
+    /// `m` would address, never a mark the send would have dropped.
+    fn marked_panes(&self) -> HashSet<String> {
+        resolved_marks(self)
+            .into_iter()
+            .map(|(pane, _)| pane)
             .collect()
     }
 
@@ -17193,6 +17225,25 @@ fn node_has_unread_idle(node: TopologyNodeRef<'_>, unread: &HashSet<String>) -> 
     }
 }
 
+/// How many marked panes this row covers. A pane answers 0 or 1; a collapsed
+/// window or session answers for everything beneath it, so marking three panes
+/// and folding the window away does not hide what the next message will go to.
+fn node_marked_count(node: TopologyNodeRef<'_>, marked: &HashSet<String>) -> usize {
+    match node {
+        TopologyNodeRef::Pane(pane) => usize::from(marked.contains(&pane.key.pane_id)),
+        TopologyNodeRef::Window(window) => window
+            .panes
+            .iter()
+            .map(|pane| node_marked_count(TopologyNodeRef::Pane(pane), marked))
+            .sum(),
+        TopologyNodeRef::Session(session) => session
+            .windows
+            .iter()
+            .map(|window| node_marked_count(TopologyNodeRef::Window(window), marked))
+            .sum(),
+    }
+}
+
 fn tree_state_cell(
     target: &TreeTarget,
     node: TopologyNodeRef<'_>,
@@ -17256,6 +17307,7 @@ fn tree_node_label(
     target: &TreeTarget,
     node: TopologyNodeRef<'_>,
     show_endpoint: bool,
+    marked: &HashSet<String>,
     theme: WatchThemeSpec,
 ) -> Text<'static> {
     let branch = match target.depth {
@@ -17319,6 +17371,14 @@ fn tree_node_label(
         ));
     } else {
         spans.push(Span::raw(label));
+    }
+    // `*` reads as "this row is in the next message". ASCII on purpose: every
+    // marker in this table has to be one cell wide in every font, and the
+    // star glyphs that look the part (`★`, `✱`) are East Asian Wide.
+    match node_marked_count(node, marked) {
+        0 => {}
+        1 => spans.push(Span::styled("  *", theme.marked_style())),
+        count => spans.push(Span::styled(format!("  *{count}"), theme.marked_style())),
     }
     // A work window that has finished looks exactly like one that stalled —
     // every agent idle — unless the row says so.
@@ -17786,6 +17846,7 @@ fn render_topology_table(
         .collect::<HashSet<_>>()
         .len();
     let unread = app.unread_sessions();
+    let marked = app.marked_panes();
     let rows: Vec<Row> = targets
         .iter()
         .filter_map(|target| {
@@ -17797,7 +17858,13 @@ fn render_topology_table(
                         Cell::from(tree_state_cell(target, node, &unread, theme, spin))
                     }
                     TopologyTableColumn::Node => {
-                        Cell::from(tree_node_label(target, node, endpoint_count > 1, theme))
+                        Cell::from(tree_node_label(
+                            target,
+                            node,
+                            endpoint_count > 1,
+                            &marked,
+                            theme,
+                        ))
                     }
                     TopologyTableColumn::Age => Cell::from(tree_node_age(app, target, node, now)),
                     TopologyTableColumn::Summary => Cell::from(truncate_chars(
@@ -19559,6 +19626,78 @@ mod tests {
             marks.is_unread_at("s0001", base + time::Duration::seconds(1)),
             "the oldest absent session goes first"
         );
+    }
+
+    /// A marked row has to say so. Marking is invisible otherwise — the
+    /// operator marks three agents, scrolls, and has no way to tell which
+    /// rows `m` is about to address.
+    #[test]
+    fn marked_rows_carry_a_star_and_parents_carry_the_count() {
+        let mut app = collaboration_watch_app();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.legacy_flat_table = false;
+        app.watch_cfg.tree_expansion = WatchTreeExpansion::Always;
+        app.set_data(
+            vec![
+                fake_agent(
+                    "one",
+                    Some("%913"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "two",
+                    Some("%42"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![
+                fake_pane("%913", "cal-7041", 0, 0, "claude"),
+                fake_pane("%42", "cal-7041", 0, 1, "claude"),
+            ],
+        );
+        for pane in ["%913", "%42"] {
+            app.collaboration_marks.insert(CollaborationMark {
+                pane: pane.into(),
+                agent_session_id: None,
+            });
+        }
+        let marked = app.marked_panes();
+        assert_eq!(marked.len(), 2);
+
+        let theme = watch_theme(WatchTheme::Classic);
+        let render = |target: &TreeTarget| {
+            let node = app.topology.find(&target.key).expect("node is live");
+            tree_node_label(target, node, false, &marked, theme)
+                .lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                .collect::<String>()
+        };
+
+        let targets = app.tree_targets();
+        let pane = targets
+            .iter()
+            .find(|t| matches!(&t.key, TopologyNodeKey::Pane(key) if key.pane_id == "%913"))
+            .expect("the marked pane has a row");
+        // A session with one window folds the window into its own row, so the
+        // session row is the parent that has to answer for both panes.
+        let parent = targets
+            .iter()
+            .find(|t| matches!(&t.key, TopologyNodeKey::Session(_)))
+            .expect("the session has a row");
+
+        assert!(render(pane).ends_with("  *"), "got {:?}", render(pane));
+        assert!(render(parent).ends_with("  *2"), "got {:?}", render(parent));
     }
 
     /// Unread must re-colour the idle marker and change nothing else — no
