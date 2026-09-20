@@ -5434,6 +5434,52 @@ impl App {
         }
     }
 
+    /// Arriving at a pane clears its whole window.
+    ///
+    /// tmux shows every pane of a window at once, so jumping to one of them
+    /// puts the others on screen too — and the jump addresses the window
+    /// (`<session>:<window>`), not just the pane. Clearing only the pane left
+    /// a two-pane window still flagged unread the moment the operator came
+    /// back, which is exactly the "did anything change here?" question the
+    /// marker exists to answer.
+    ///
+    /// The send path deliberately keeps [`App::mark_pane_read`]: answering one
+    /// agent says nothing about whether its neighbour's output was read.
+    ///
+    /// A zoomed pane hides its siblings and would be marked read without being
+    /// seen. The topology does not carry zoom state, and the cost is one row
+    /// that stops nagging early — cheaper than the whole window nagging after
+    /// every visit.
+    fn mark_window_read(&mut self, pane_id: &str) {
+        let targets: Vec<(String, OffsetDateTime)> = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .find(|window| {
+                window
+                    .panes
+                    .iter()
+                    .any(|pane| pane.key.pane_id == pane_id)
+            })
+            .map(|window| {
+                window
+                    .panes
+                    .iter()
+                    .filter_map(|pane| pane.agent.as_ref())
+                    .map(|agent| (agent.session_id.clone(), agent.last_activity_at))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if targets.is_empty() {
+            return;
+        }
+        for (session, activity) in targets {
+            self.read_marks.mark_read_at(&session, activity);
+        }
+        self.read_marks.flush();
+    }
+
     /// Keep the read-marks file bounded. Deliberately not "forget everyone the
     /// snapshot did not name" — see [`ReadMarks::bound`] for why a snapshot is
     /// not evidence of absence.
@@ -8291,15 +8337,17 @@ pub async fn run(
                 }
                 // Going to the pane is reading it — the whole point of the
                 // marker is to stop the operator opening panes to find out
-                // whether anything changed, so arriving must clear it.
+                // whether anything changed, so arriving must clear it. The
+                // whole window clears, because arriving shows the whole
+                // window.
                 Action::AttachPane(pane) => {
-                    app.mark_pane_read(&pane);
+                    app.mark_window_read(&pane);
                     jump_target = Some(WatchOpenTarget::LegacyPane(pane));
                     quit = true;
                     break;
                 }
                 Action::AttachTopologyPane(pane) => {
-                    app.mark_pane_read(&pane.pane_id);
+                    app.mark_window_read(&pane.pane_id);
                     jump_target = Some(WatchOpenTarget::TopologyPane(pane));
                     quit = true;
                     break;
@@ -20006,6 +20054,46 @@ mod tests {
         assert_eq!(composer_pane(&app), "%32");
         let composer = app.collaboration_composer.as_ref().expect("composer open");
         assert_eq!(composer.recipient, 1, "the ring opens positioned on it");
+    }
+
+    /// Jumping into a window puts every pane of it on screen, so coming back
+    /// must not find the window still flagged. Clearing only the pane that was
+    /// selected left a two-pane window unread forever.
+    #[test]
+    fn arriving_at_a_pane_clears_its_whole_window() {
+        let mut app = two_pane_window_app();
+        let unread = app.unread_sessions();
+        assert_eq!(unread.len(), 2, "both agents start unread");
+
+        app.mark_window_read("%21");
+
+        assert!(
+            app.unread_sessions().is_empty(),
+            "the pane beside the one jumped to is on screen too, got {:?}",
+            app.unread_sessions()
+        );
+    }
+
+    /// Answering one agent is not reading its neighbour, so the send path must
+    /// keep clearing exactly the pane it delivered to.
+    #[test]
+    fn answering_one_agent_leaves_its_neighbour_unread() {
+        let mut app = two_pane_window_app();
+
+        app.mark_pane_read("%21");
+
+        let unread = app.unread_sessions();
+        assert_eq!(unread.len(), 1, "only the answered agent clears");
+        let neighbour = app
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .find(|pane| pane.key.pane_id == "%32")
+            .and_then(|pane| pane.agent.as_ref())
+            .expect("the neighbour is tracked");
+        assert!(unread.contains(&neighbour.session_id));
     }
 
     /// A marked row has to say so. Marking is invisible otherwise — the
