@@ -3055,6 +3055,19 @@ impl BroadcastReport {
     }
 }
 
+/// One pane a composer could send to, as the roster orders them.
+///
+/// A window row covers several agents, and `m` had to pick one: it took the
+/// lowest-numbered live pane, and the other agents in that window were
+/// unreachable without descending the tree first. The composer now carries
+/// the whole row as a ring and `Ctrl-D` walks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposerRecipient {
+    pane: String,
+    pane_key: Option<PaneKey>,
+    label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CollaborationComposer {
     target: CollaborationComposeTarget,
@@ -3065,6 +3078,19 @@ struct CollaborationComposer {
     /// saved composer cursor; it never sends without a second, deliberate
     /// Enter.
     skill_palette: Option<MessageSkillPalette>,
+    /// Every pane the row under the cursor could address. One entry when the
+    /// cursor named a pane outright, and empty for targets that are not a
+    /// single pane at all (a broadcast, a reply).
+    recipients: Vec<ComposerRecipient>,
+    recipient: usize,
+    /// The row the composer was opened from. The pane finally sent to is
+    /// remembered against it, so `m` on that row returns to whoever the
+    /// operator was last talking to.
+    ///
+    /// Boxed: a `TopologyNodeKey` is four owned strings, and the watch loop's
+    /// future embeds `App` by value — inlining it here pushed that future
+    /// past clippy's large-future threshold.
+    origin_node: Option<Box<TopologyNodeKey>>,
 }
 
 impl CollaborationComposer {
@@ -3075,7 +3101,60 @@ impl CollaborationComposer {
             input: String::new(),
             cursor: 0,
             skill_palette: None,
+            recipients: Vec::new(),
+            recipient: 0,
+            origin_node: None,
         }
+    }
+
+    /// Attach the ring `Ctrl-D` walks, already positioned on the pane the
+    /// target was built from.
+    fn with_recipients(
+        mut self,
+        recipients: Vec<ComposerRecipient>,
+        recipient: usize,
+        origin_node: Option<TopologyNodeKey>,
+    ) -> Self {
+        self.recipients = recipients;
+        self.recipient = recipient;
+        self.origin_node = origin_node.map(Box::new);
+        self
+    }
+
+    /// `Ctrl-D`: point the composer at the next pane the row covers.
+    ///
+    /// Forward only, and wrapping: `Tab` and `Shift-Tab` already own the
+    /// composer's two other cycles, and a ring of two — the common case, a
+    /// window holding an agent and its container — needs no reverse.
+    /// Returns the new label when it moved.
+    fn next_recipient(&mut self) -> Option<String> {
+        if self.recipients.len() < 2 {
+            return None;
+        }
+        let CollaborationComposeTarget::Send {
+            target,
+            pane,
+            pane_key,
+            ..
+        } = &mut self.target
+        else {
+            return None;
+        };
+        self.recipient = (self.recipient + 1) % self.recipients.len();
+        let chosen = &self.recipients[self.recipient];
+        *target = format!("pane:{}", chosen.pane);
+        pane.clone_from(&chosen.pane);
+        pane_key.clone_from(&chosen.pane_key);
+        self.label.clone_from(&chosen.label);
+        Some(self.label.clone())
+    }
+
+    /// `(row, pane)` to remember once the send lands.
+    fn destination(&self) -> Option<(TopologyNodeKey, String)> {
+        let CollaborationComposeTarget::Send { pane, .. } = &self.target else {
+            return None;
+        };
+        Some((*self.origin_node.clone()?, pane.clone()))
     }
 
     fn insert(&mut self, c: char) {
@@ -3340,6 +3419,11 @@ pub(crate) struct App {
     /// Which agents the operator has already caught up on. Survives restarts;
     /// see [`ReadMarks`].
     read_marks: ReadMarks,
+    /// The pane each roster row was last messaged from the composer.
+    ///
+    /// In memory only: it is a within-session habit, not a reading position,
+    /// and a stale entry would quietly redirect a message after a restart.
+    last_message_pane: HashMap<TopologyNodeKey, String>,
     /// Explicitly expanded session/window keys. Pane keys are leaves and never
     /// enter this set. Keys survive refresh and sort because they include the
     /// complete host+socket ancestry.
@@ -3738,6 +3822,7 @@ impl App {
             read_marks: ReadMarks::load(None),
             #[cfg(not(test))]
             read_marks: ReadMarks::load(muxa::paths::default_watch_read_file()),
+            last_message_pane: HashMap::new(),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
             filtered_selection_anchor: None,
@@ -5292,6 +5377,31 @@ impl App {
         resolved_marks(self)
             .into_iter()
             .map(|(pane, _)| pane)
+            .collect()
+    }
+
+    /// Every live agent pane the selected row covers, in roster order — the
+    /// ring `Ctrl-D` walks. A pane row answers with itself; a window or
+    /// session row answers with everything beneath it.
+    fn composer_recipients(&self) -> Vec<ComposerRecipient> {
+        self.selected_topology_panes()
+            .into_iter()
+            .filter(|pane| {
+                pane.agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.state != AgentState::Stopped)
+            })
+            .filter_map(|pane| {
+                Some(ComposerRecipient {
+                    pane: pane.key.pane_id.clone(),
+                    pane_key: Some(pane.key.clone()),
+                    label: format!(
+                        "{} · {}",
+                        topology_pane_peer_label(pane)?,
+                        self.pane_label(&pane.key.pane_id)
+                    ),
+                })
+            })
             .collect()
     }
 
@@ -8505,8 +8615,17 @@ pub async fn run(
                 }
                 Action::SubmitCollaboration => {
                     if let Some(composer) = app.collaboration_composer.take() {
+                        // Read the destination off the composer before it is
+                        // consumed: a delivered message is what makes a pane
+                        // this row's default, so `m` comes back to whoever the
+                        // operator was actually talking to.
+                        let destination = composer.destination();
                         let (outcome, report) =
                             run_watch_collaboration_composer(client, composer).await;
+                        if let (ActionOutcome::Ok(_), Some((node, pane))) = (&outcome, destination)
+                        {
+                            app.last_message_pane.insert(node, pane);
+                        }
                         if let Some(report) = report.as_ref() {
                             // A delivered recipient consumes its mark; a failed
                             // one keeps it, so the retry is the same key press
@@ -9353,6 +9472,17 @@ fn peer_choice_hint(labels: &[String]) -> String {
 /// sender is the operator console, not that pane's agent, so there is no
 /// self-send to guard against — and the row the operator was sitting on when
 /// they hit the key is a likely thing to want to poke.
+/// How a tracked pane names itself to the composer: `claude@%21 · <row>`.
+fn topology_pane_peer_label(pane: &PaneNode) -> Option<String> {
+    let agent = pane.agent.as_ref()?;
+    Some(format!(
+        "{}@{} · {}",
+        agent.kind,
+        pane.key.pane_id,
+        topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
+    ))
+}
+
 fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
     if app.collaboration_scope != muxa::config::CollaborationScope::Host {
         return None;
@@ -9363,13 +9493,7 @@ fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
                 .as_ref()
                 .is_some_and(|agent| agent.state != AgentState::Stopped)
         })?;
-        let agent = pane.agent.as_ref()?;
-        let label = format!(
-            "{}@{} · {}",
-            agent.kind,
-            pane.key.pane_id,
-            topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
-        );
+        let label = topology_pane_peer_label(pane)?;
         return Some((pane.key.pane_id.clone(), label, Some(pane.key.clone())));
     }
     let selected = app.selected_target()?;
@@ -9701,17 +9825,54 @@ fn open_watch_collaboration_composer(app: &mut App) {
     // while positions are legible and drift.
     let label = format!("{peer_label} · {}", app.pane_label(&peer_pane));
     let defaults = app.collaboration_compose_defaults;
-    app.collaboration_composer = Some(CollaborationComposer::new(
-        CollaborationComposeTarget::Send {
-            origin,
-            target: format!("pane:{peer_pane}"),
-            pane: peer_pane,
-            pane_key,
-            kind: defaults.kind,
-            mode: defaults.mode,
-        },
-        label,
-    ));
+    let origin_node = app.selected_node_key();
+    let mut recipients = app.composer_recipients();
+    // A ring that does not contain the pane the cursor resolved to is not
+    // this row's ring — window scope, or a target the topology cannot see.
+    // Fall back to the single recipient rather than offer a wrong cycle.
+    match recipients
+        .iter_mut()
+        .find(|entry| entry.pane == peer_pane)
+    {
+        // The cursor's own resolution wins for its own entry. It carries the
+        // room's idea of the pane key, which is not always the topology's,
+        // and opening the composer must stay byte-identical to before.
+        Some(entry) => {
+            entry.pane_key.clone_from(&pane_key);
+            entry.label.clone_from(&label);
+        }
+        None => {
+            recipients = vec![ComposerRecipient {
+                pane: peer_pane.clone(),
+                pane_key: pane_key.clone(),
+                label: label.clone(),
+            }];
+        }
+    }
+    // Whoever this row was last messaged wins over whoever sorts first. The
+    // operator asked this window a question a minute ago; `m` should not
+    // silently address a different agent in it.
+    let selected = origin_node
+        .as_ref()
+        .and_then(|node| app.last_message_pane.get(node))
+        .and_then(|pane| recipients.iter().position(|entry| entry.pane == *pane))
+        .or_else(|| recipients.iter().position(|entry| entry.pane == peer_pane))
+        .unwrap_or(0);
+    let chosen = recipients[selected].clone();
+    app.collaboration_composer = Some(
+        CollaborationComposer::new(
+            CollaborationComposeTarget::Send {
+                origin,
+                target: format!("pane:{}", chosen.pane),
+                pane: chosen.pane,
+                pane_key: chosen.pane_key,
+                kind: defaults.kind,
+                mode: defaults.mode,
+            },
+            chosen.label,
+        )
+        .with_recipients(recipients, selected, origin_node),
+    );
 }
 
 async fn run_watch_collaboration_composer(
@@ -12137,6 +12298,21 @@ fn handle_collaboration_composer_event(
             }
             Action::None
         }
+        // `Ctrl-D`, not `Tab`: `Tab` and `Shift-Tab` already cycle the kind
+        // and the mode, and no macOS chord sends `\x04` the way `Cmd+Right`
+        // sends `Ctrl-E` — so this one cannot be pressed by accident while
+        // editing the line.
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            let moved = app
+                .collaboration_composer
+                .as_mut()
+                .and_then(CollaborationComposer::next_recipient);
+            match moved {
+                Some(label) => app.set_hint(format!("to {label}"), HintLevel::Ok),
+                None => app.set_hint("this row has only one agent", HintLevel::Warn),
+            }
+            Action::None
+        }
         KeyCode::Char('b') if modifiers.contains(KeyModifiers::ALT) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
                 composer.move_word_left();
@@ -13929,6 +14105,26 @@ fn render_broadcast_report(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The `Ctrl-D` hint, and only when there is somewhere to cycle to. A window
+/// holding one agent must not advertise a key that would do nothing.
+fn recipient_cycle_spans(
+    composer: &CollaborationComposer,
+    theme: WatchThemeSpec,
+) -> Vec<Span<'static>> {
+    if composer.recipients.len() < 2 {
+        return Vec::new();
+    }
+    vec![
+        Span::raw(" "),
+        Span::styled(" Ctrl-D ", theme.key_badge()),
+        Span::raw(format!(
+            "pane {}/{} ",
+            composer.recipient + 1,
+            composer.recipients.len()
+        )),
+    ]
+}
+
 fn collaboration_composer_title(
     composer: &CollaborationComposer,
     theme: WatchThemeSpec,
@@ -13990,7 +14186,11 @@ fn collaboration_composer_title(
                     Span::raw("kind  "),
                     Span::styled(" Shift-Tab ", theme.key_badge()),
                     Span::raw("mode "),
-                ]),
+                ]
+                .into_iter()
+                .chain(recipient_cycle_spans(composer, theme))
+                .collect::<Vec<_>>(),
+                ),
                 border,
             )
         }
@@ -19649,6 +19849,163 @@ mod tests {
             marks.is_unread_at("s0001", base + time::Duration::seconds(1)),
             "the oldest absent session goes first"
         );
+    }
+
+    /// A two-pane window fixture: `%21` sorts first, `%32` is the one the
+    /// operator has to be able to reach without descending the tree.
+    fn two_pane_window_app() -> App {
+        let mut app = collaboration_watch_app();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.legacy_flat_table = false;
+        app.watch_cfg.tree_expansion = WatchTreeExpansion::Always;
+        app.set_data(
+            vec![
+                fake_agent(
+                    "first",
+                    Some("%21"),
+                    AgentKind::ClaudeCode,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                fake_agent(
+                    "second",
+                    Some("%32"),
+                    AgentKind::Codex,
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            vec![
+                fake_pane("%21", "vuln", 0, 0, "claude"),
+                fake_pane("%32", "vuln", 0, 1, "codex"),
+            ],
+        );
+        app
+    }
+
+    fn select_window_row(app: &mut App) -> TopologyNodeKey {
+        let target = app
+            .tree_targets()
+            .into_iter()
+            .find(|target| {
+                !matches!(target.key, TopologyNodeKey::Pane(_))
+                    && node_marked_count(
+                        app.topology.find(&target.key).expect("node is live"),
+                        &HashSet::new(),
+                    ) == 0
+            })
+            .expect("a parent row exists");
+        let index = app
+            .tree_targets()
+            .iter()
+            .position(|candidate| candidate.key == target.key)
+            .expect("the row is visible");
+        app.table_state.select(Some(index));
+        target.key
+    }
+
+    fn composer_pane(app: &App) -> String {
+        let Some(CollaborationComposeTarget::Send { pane, .. }) =
+            app.collaboration_composer.as_ref().map(|c| &c.target)
+        else {
+            panic!("expected a single-pane send composer");
+        };
+        pane.clone()
+    }
+
+    /// `m` on a window row used to address whichever pane sorted first, and
+    /// the other agents in that window were unreachable without descending
+    /// the tree. `Ctrl-D` walks the row instead.
+    #[test]
+    fn ctrl_d_cycles_the_composer_through_the_panes_of_a_row() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+
+        open_watch_collaboration_composer(&mut app);
+        assert_eq!(composer_pane(&app), "%21", "the first pane still opens");
+
+        let composer = app.collaboration_composer.as_ref().expect("composer open");
+        assert_eq!(composer.recipients.len(), 2, "both panes are reachable");
+
+        handle_collaboration_composer_event(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut app,
+        );
+        assert_eq!(composer_pane(&app), "%32");
+        let composer = app.collaboration_composer.as_ref().expect("composer open");
+        assert!(
+            composer.label.contains("%32"),
+            "the title has to say who it is now addressing, got {:?}",
+            composer.label
+        );
+
+        // Forward only, and wrapping.
+        handle_collaboration_composer_event(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut app,
+        );
+        assert_eq!(composer_pane(&app), "%21");
+    }
+
+    /// A pane row names one agent outright, so there is nothing to cycle and
+    /// the footer must not advertise a key that would do nothing.
+    #[test]
+    fn a_pane_row_composer_has_nothing_to_cycle() {
+        let mut app = two_pane_window_app();
+        let index = app
+            .tree_targets()
+            .iter()
+            .position(|target| matches!(&target.key, TopologyNodeKey::Pane(key) if key.pane_id == "%32"))
+            .expect("the pane row is visible");
+        app.table_state.select(Some(index));
+
+        open_watch_collaboration_composer(&mut app);
+
+        let composer = app.collaboration_composer.as_ref().expect("composer open");
+        assert_eq!(composer.recipients.len(), 1);
+        assert_eq!(composer_pane(&app), "%32");
+        assert!(recipient_cycle_spans(composer, watch_theme(WatchTheme::Classic)).is_empty());
+    }
+
+    /// The point of remembering: the operator messaged `%32` from this row, so
+    /// the next `m` on it opens on `%32` rather than back on whoever sorts
+    /// first.
+    #[test]
+    fn m_returns_to_the_pane_this_row_was_last_messaged() {
+        let mut app = two_pane_window_app();
+        let row = select_window_row(&mut app);
+
+        open_watch_collaboration_composer(&mut app);
+        handle_collaboration_composer_event(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut app,
+        );
+        let destination = app
+            .collaboration_composer
+            .as_ref()
+            .expect("composer open")
+            .destination()
+            .expect("a single-pane send has a destination");
+        assert_eq!(destination, (row, "%32".to_string()));
+
+        // What the submit path does once the daemon accepts the request.
+        app.last_message_pane
+            .insert(destination.0.clone(), destination.1.clone());
+        app.collaboration_composer = None;
+
+        open_watch_collaboration_composer(&mut app);
+        assert_eq!(composer_pane(&app), "%32");
+        let composer = app.collaboration_composer.as_ref().expect("composer open");
+        assert_eq!(composer.recipient, 1, "the ring opens positioned on it");
     }
 
     /// A marked row has to say so. Marking is invisible otherwise — the
