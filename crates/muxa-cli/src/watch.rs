@@ -9269,7 +9269,7 @@ fn open_watch_collaboration_composer(app: &mut App) {
         let defaults = app.collaboration_compose_defaults;
         // just-send types into one pane; a marked set has no pane to type
         // into. Opening in a mode that cannot send would leave Enter refusing
-        // and Ctrl-E the only way out, so the set opens read-only instead.
+        // and Shift-Tab the only way out, so the set opens read-only instead.
         let mode = match defaults.mode {
             ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
             mode => mode,
@@ -13578,7 +13578,7 @@ fn collaboration_composer_title(
                     ),
                     Span::styled(" Tab ", theme.key_badge()),
                     Span::raw("kind  "),
-                    Span::styled(" Ctrl-E ", theme.key_badge()),
+                    Span::styled(" Shift-Tab ", theme.key_badge()),
                     Span::raw("mode "),
                 ]),
                 border,
@@ -18631,7 +18631,7 @@ fn render_collaboration_composer_footer(
         return;
     }
     let target = composer.map(|composer| &composer.target);
-    // The peerless prompt form advertises no Tab/Ctrl-E: both keys only
+    // The peerless prompt form advertises no Tab/Shift-Tab: both keys only
     // explain why they do nothing, and a footer that lists dead keys
     // teaches the user to stop reading footers.
     let mut spans = vec![
@@ -18661,7 +18661,7 @@ fn render_collaboration_composer_footer(
     }
     if matches!(target, Some(CollaborationComposeTarget::Send { .. })) {
         spans.extend([
-            Span::styled(" Ctrl-E ", theme.key_badge()),
+            Span::styled(" Shift-Tab ", theme.key_badge()),
             Span::raw("read-only/execute/just-send  "),
         ]);
     }
@@ -22818,7 +22818,7 @@ mod tests {
     /// A set cannot be addressed by keystrokes, so a composer opened against
     /// marks never starts in the one mode `Enter` would refuse. Without this
     /// a persisted just-send default left the operator with a hint pointing
-    /// at Ctrl-E and no way to send.
+    /// at Shift-Tab and no way to send.
     #[test]
     fn a_marked_composer_never_opens_in_a_mode_it_cannot_send_from() {
         let (agents, panes) = basic_topology_fixture();
@@ -22854,7 +22854,7 @@ mod tests {
         };
         assert_eq!(mode, ComposeSendMode::ReadOnly);
 
-        // And Ctrl-E cycles between the two modes a set can be sent in,
+        // And Shift-Tab cycles between the two modes a set can be sent in,
         // rather than doing nothing.
         assert!(composer_cycle_mode(&mut app));
         let Some(CollaborationComposeTarget::Broadcast { mode, .. }) = app
