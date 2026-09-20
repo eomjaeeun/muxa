@@ -5380,6 +5380,25 @@ impl App {
             .collect()
     }
 
+    /// Every live agent the selected row stands for, as `(pane, session id)`.
+    ///
+    /// A window row stands for its panes, and a session row for every pane
+    /// under it — the same set a broadcast from that row would reach. `Space`
+    /// marks that set rather than whichever single pane the cursor resolved
+    /// to.
+    fn markable_agents(&self) -> Vec<(String, String)> {
+        self.selected_topology_panes()
+            .into_iter()
+            .filter_map(|pane| {
+                let agent = pane.agent.as_ref()?;
+                if agent.state == AgentState::Stopped {
+                    return None;
+                }
+                Some((pane.key.pane_id.clone(), agent.session_id.clone()))
+            })
+            .collect()
+    }
+
     /// Every live agent pane the selected row covers, in roster order — the
     /// ring `Ctrl-D` walks. A pane row answers with itself; a window or
     /// session row answers with everything beneath it.
@@ -9702,11 +9721,19 @@ fn collaboration_target_at_cursor(
     }
 }
 
-/// `Space`: mark or unmark the agent under the cursor.
+/// `Space`: mark or unmark the agents under the cursor.
 ///
 /// Deliberately the same resolution `m` uses, so what you mark is what you
-/// would have messaged.
+/// would have messaged — which for a window or session row is every agent
+/// beneath it, not whichever pane happened to sort first. A row that is
+/// already fully marked unmarks; anything else marks the lot, because an
+/// operator pressing `Space` on a half-marked window wants the window in the
+/// message, not the half of it that is out.
 fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
+    let row = app.markable_agents();
+    if row.len() > 1 {
+        return toggle_row_collaboration_marks(app, row);
+    }
     let (pane, label, _, agent_session_id) = match collaboration_target_at_cursor(app) {
         Ok(target) => target,
         Err(reason) => return ActionOutcome::Err(reason),
@@ -9727,6 +9754,48 @@ fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
             app.collaboration_marks.len()
         ))
     }
+}
+
+/// Mark or unmark every agent a parent row stands for.
+fn toggle_row_collaboration_marks(
+    app: &mut App,
+    row: Vec<(String, String)>,
+) -> ActionOutcome {
+    let already = |app: &App, pane: &str, session: &str| {
+        app.collaboration_marks.iter().any(|mark| {
+            mark.pane == pane
+                && mark
+                    .agent_session_id
+                    .as_ref()
+                    .is_none_or(|marked| marked == session)
+        })
+    };
+    let count = row.len();
+    if row
+        .iter()
+        .all(|(pane, session)| already(app, pane, session))
+    {
+        // Drop by pane, not by exact mark: a mark left by an earlier session
+        // on the same pane would otherwise survive an unmark and quietly
+        // rejoin the next broadcast.
+        let panes: HashSet<&str> = row.iter().map(|(pane, _)| pane.as_str()).collect();
+        app.collaboration_marks
+            .retain(|mark| !panes.contains(mark.pane.as_str()));
+        return ActionOutcome::Ok(format!(
+            "unmarked {count} agents · {} marked",
+            app.collaboration_marks.len()
+        ));
+    }
+    for (pane, session) in row {
+        app.collaboration_marks.insert(CollaborationMark {
+            pane,
+            agent_session_id: Some(session),
+        });
+    }
+    ActionOutcome::Ok(format!(
+        "marked {count} agents · {} marked",
+        app.collaboration_marks.len()
+    ))
 }
 
 /// The marked recipients that still exist, as `(pane, label)`.
@@ -20105,6 +20174,51 @@ mod tests {
         assert_eq!(composer.recipient, 1, "the ring opens positioned on it");
     }
 
+    /// `Space` on a window row has to mean "this window", not "whichever pane
+    /// of it sorts first" — otherwise marking a window and sending reaches one
+    /// agent while the row's star says the window is in.
+    #[test]
+    fn space_on_a_window_row_marks_every_agent_in_it() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+
+        assert!(matches!(
+            toggle_collaboration_mark(&mut app),
+            ActionOutcome::Ok(_)
+        ));
+
+        let panes: Vec<_> = resolved_marks(&app)
+            .into_iter()
+            .map(|(pane, _)| pane)
+            .collect();
+        assert_eq!(panes, ["%21", "%32"], "the whole window is addressed");
+
+        // Pressing it again on a fully marked row clears the row.
+        toggle_collaboration_mark(&mut app);
+        assert!(resolved_marks(&app).is_empty());
+        assert!(app.collaboration_marks.is_empty(), "no stale marks survive");
+    }
+
+    /// A half-marked row resolves to "mark the rest", not "invert": pressing
+    /// Space on a window that shows some marks means the window should be in.
+    #[test]
+    fn space_on_a_half_marked_row_completes_it() {
+        let mut app = two_pane_window_app();
+        app.collaboration_marks.insert(CollaborationMark {
+            pane: "%32".into(),
+            agent_session_id: None,
+        });
+        select_window_row(&mut app);
+
+        toggle_collaboration_mark(&mut app);
+
+        let panes: Vec<_> = resolved_marks(&app)
+            .into_iter()
+            .map(|(pane, _)| pane)
+            .collect();
+        assert_eq!(panes, ["%21", "%32"]);
+    }
+
     /// While a message is being written the mosaic must answer "where does
     /// Enter send this", not "where is tmux's cursor" — and `Ctrl-D` has to
     /// move that answer.
@@ -23938,8 +24052,9 @@ mod tests {
         assert_eq!(panes, ["%1", "%2"]);
     }
 
-    /// Pressing `Space` twice on one agent leaves nothing marked, and `m`
-    /// goes back to addressing the cursor.
+    /// Pressing `Space` twice leaves nothing marked, and `m` goes back to
+    /// addressing the cursor. The cursor here sits on the session row, which
+    /// stands for both panes, so each press moves the pair together.
     #[test]
     fn unmarking_the_last_agent_restores_the_single_recipient_composer() {
         let (agents, panes) = basic_topology_fixture();
@@ -23957,8 +24072,10 @@ mod tests {
             unread_replies: 0,
         });
 
+        let row = app.markable_agents().len();
+        assert_eq!(row, 2, "the selected row stands for both panes");
         toggle_collaboration_mark(&mut app);
-        assert_eq!(app.collaboration_marks.len(), 1);
+        assert_eq!(app.collaboration_marks.len(), row);
         toggle_collaboration_mark(&mut app);
         assert!(app.collaboration_marks.is_empty());
 
