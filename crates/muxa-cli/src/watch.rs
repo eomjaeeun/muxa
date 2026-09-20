@@ -16577,6 +16577,7 @@ fn render_window_mosaic_cell(
     captured: &CapturedWindowPane,
     theme: WatchThemeSpec,
     spin: Spinner,
+    destination: Option<MosaicDestination<'_>>,
 ) {
     let pane = window
         .panes
@@ -16587,17 +16588,23 @@ fn render_window_mosaic_cell(
         || ("○", theme.dim_style()),
         |agent| state_marker(agent.state, theme, spin),
     );
+    // While composing, only the destination is lit: two highlights meaning two
+    // different things in one grid is worse than losing sight of the active
+    // pane for as long as the composer is open.
+    let lit = destination.map_or(captured.geometry.active, |target| {
+        target.pane == captured.geometry.pane_id
+    });
+    let pane_style = if !lit {
+        Style::default()
+    } else if destination.is_some() {
+        theme.action_badge().add_modifier(Modifier::BOLD)
+    } else {
+        theme.accent_badge()
+    };
     let mut title = vec![
         Span::raw(" "),
         Span::styled(glyph.to_string(), state_style),
-        Span::styled(
-            format!(" {}", captured.geometry.pane_id),
-            if captured.geometry.active {
-                theme.accent_badge()
-            } else {
-                Style::default()
-            },
-        ),
+        Span::styled(format!(" {}", captured.geometry.pane_id), pane_style),
     ];
     if rect.width >= 18 {
         let detail = agent.map_or_else(
@@ -16676,6 +16683,31 @@ fn render_window_mosaic_cell(
     );
 }
 
+/// Where an open composer is pointing, for the mosaic to show.
+///
+/// The grid already highlights tmux's active pane, which answers "where does
+/// the cursor land if I jump". While a message is being written the useful
+/// question is a different one — "where does Enter send it" — and `Ctrl-D`
+/// moves that answer without moving tmux's. So during composition the
+/// destination takes the highlight over, in the action colour rather than the
+/// accent, and the header says which question is being answered.
+#[derive(Debug, Clone, Copy)]
+struct MosaicDestination<'a> {
+    pane: &'a str,
+    cycles: bool,
+}
+
+fn composer_mosaic_destination(app: &App) -> Option<MosaicDestination<'_>> {
+    let composer = app.collaboration_composer.as_ref()?;
+    let CollaborationComposeTarget::Send { pane, .. } = &composer.target else {
+        return None;
+    };
+    Some(MosaicDestination {
+        pane: pane.as_str(),
+        cycles: composer.recipients.len() > 1,
+    })
+}
+
 fn render_window_mosaic(
     f: &mut Frame,
     area: Rect,
@@ -16683,13 +16715,22 @@ fn render_window_mosaic(
     capture: &CapturedWindow,
     theme: WatchThemeSpec,
     spin: Spinner,
+    destination: Option<MosaicDestination<'_>>,
 ) {
     f.render_widget(Clear, area);
     let header = Rect { height: 1, ..area };
+    let subtitle = match destination {
+        Some(MosaicDestination { pane, cycles: true }) => format!("  → {pane} · Ctrl-D next"),
+        Some(MosaicDestination {
+            pane,
+            cycles: false,
+        }) => format!("  → {pane}"),
+        None => "  pane geometry · 1s refresh".to_string(),
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("live layout", theme.accent_badge()),
-            Span::styled("  pane geometry · 1s refresh", theme.dim_style()),
+            Span::styled(subtitle, theme.dim_style()),
         ])),
         header,
     );
@@ -16725,7 +16766,7 @@ fn render_window_mosaic(
         let Some(rect) = rect else {
             continue;
         };
-        render_window_mosaic_cell(f, rect, window, captured, theme, spin);
+        render_window_mosaic_cell(f, rect, window, captured, theme, spin, destination);
     }
 }
 
@@ -17152,7 +17193,15 @@ fn render_topology_inspector(
             matching_window_capture(app, window),
             window_mosaic_area(area, window),
         ) {
-            render_window_mosaic(f, mosaic_area, window, capture, theme, spin);
+            render_window_mosaic(
+                f,
+                mosaic_area,
+                window,
+                capture,
+                theme,
+                spin,
+                composer_mosaic_destination(app),
+            );
         }
     }
 }
@@ -20054,6 +20103,30 @@ mod tests {
         assert_eq!(composer_pane(&app), "%32");
         let composer = app.collaboration_composer.as_ref().expect("composer open");
         assert_eq!(composer.recipient, 1, "the ring opens positioned on it");
+    }
+
+    /// While a message is being written the mosaic must answer "where does
+    /// Enter send this", not "where is tmux's cursor" — and `Ctrl-D` has to
+    /// move that answer.
+    #[test]
+    fn the_live_layout_follows_the_composer_destination() {
+        let mut app = two_pane_window_app();
+        assert!(
+            composer_mosaic_destination(&app).is_none(),
+            "with no composer the grid keeps showing tmux's active pane"
+        );
+
+        select_window_row(&mut app);
+        open_watch_collaboration_composer(&mut app);
+
+        let destination = composer_mosaic_destination(&app).expect("a send composer points at one");
+        assert_eq!(destination.pane, "%21");
+        assert!(destination.cycles, "two panes means Ctrl-D is worth naming");
+
+        handle_collaboration_composer_event(KeyCode::Char('d'), KeyModifiers::CONTROL, &mut app);
+
+        let destination = composer_mosaic_destination(&app).expect("still composing");
+        assert_eq!(destination.pane, "%32", "Ctrl-D moved the highlight");
     }
 
     /// Jumping into a window puts every pane of it on screen, so coming back
