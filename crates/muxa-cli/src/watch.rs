@@ -1962,7 +1962,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m / M / Space  message selected or marked / mailbox / mark agent",
+        "  m / M / Space  message / mailbox / mark · Tab picks the window’s pane",
         "  u / U · Alt-A  unread on row / all read · attention-only filter",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
@@ -3055,19 +3055,6 @@ impl BroadcastReport {
     }
 }
 
-/// One pane a composer could send to, as the roster orders them.
-///
-/// A window row covers several agents, and `m` had to pick one: it took the
-/// lowest-numbered live pane, and the other agents in that window were
-/// unreachable without descending the tree first. The composer now carries
-/// the whole row as a ring and `Ctrl-D` walks it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ComposerRecipient {
-    pane: String,
-    pane_key: Option<PaneKey>,
-    label: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CollaborationComposer {
     target: CollaborationComposeTarget,
@@ -3078,19 +3065,6 @@ struct CollaborationComposer {
     /// saved composer cursor; it never sends without a second, deliberate
     /// Enter.
     skill_palette: Option<MessageSkillPalette>,
-    /// Every pane the row under the cursor could address. One entry when the
-    /// cursor named a pane outright, and empty for targets that are not a
-    /// single pane at all (a broadcast, a reply).
-    recipients: Vec<ComposerRecipient>,
-    recipient: usize,
-    /// The row the composer was opened from. The pane finally sent to is
-    /// remembered against it, so `m` on that row returns to whoever the
-    /// operator was last talking to.
-    ///
-    /// Boxed: a `TopologyNodeKey` is four owned strings, and the watch loop's
-    /// future embeds `App` by value — inlining it here pushed that future
-    /// past clippy's large-future threshold.
-    origin_node: Option<Box<TopologyNodeKey>>,
 }
 
 impl CollaborationComposer {
@@ -3101,60 +3075,7 @@ impl CollaborationComposer {
             input: String::new(),
             cursor: 0,
             skill_palette: None,
-            recipients: Vec::new(),
-            recipient: 0,
-            origin_node: None,
         }
-    }
-
-    /// Attach the ring `Ctrl-D` walks, already positioned on the pane the
-    /// target was built from.
-    fn with_recipients(
-        mut self,
-        recipients: Vec<ComposerRecipient>,
-        recipient: usize,
-        origin_node: Option<TopologyNodeKey>,
-    ) -> Self {
-        self.recipients = recipients;
-        self.recipient = recipient;
-        self.origin_node = origin_node.map(Box::new);
-        self
-    }
-
-    /// `Ctrl-D`: point the composer at the next pane the row covers.
-    ///
-    /// Forward only, and wrapping: `Tab` and `Shift-Tab` already own the
-    /// composer's two other cycles, and a ring of two — the common case, a
-    /// window holding an agent and its container — needs no reverse.
-    /// Returns the new label when it moved.
-    fn next_recipient(&mut self) -> Option<String> {
-        if self.recipients.len() < 2 {
-            return None;
-        }
-        let CollaborationComposeTarget::Send {
-            target,
-            pane,
-            pane_key,
-            ..
-        } = &mut self.target
-        else {
-            return None;
-        };
-        self.recipient = (self.recipient + 1) % self.recipients.len();
-        let chosen = &self.recipients[self.recipient];
-        *target = format!("pane:{}", chosen.pane);
-        pane.clone_from(&chosen.pane);
-        pane_key.clone_from(&chosen.pane_key);
-        self.label.clone_from(&chosen.label);
-        Some(self.label.clone())
-    }
-
-    /// `(row, pane)` to remember once the send lands.
-    fn destination(&self) -> Option<(TopologyNodeKey, String)> {
-        let CollaborationComposeTarget::Send { pane, .. } = &self.target else {
-            return None;
-        };
-        Some((*self.origin_node.clone()?, pane.clone()))
     }
 
     fn insert(&mut self, c: char) {
@@ -3419,11 +3340,17 @@ pub(crate) struct App {
     /// Which agents the operator has already caught up on. Survives restarts;
     /// see [`ReadMarks`].
     read_marks: ReadMarks,
-    /// The pane each roster row was last messaged from the composer.
+    /// Which pane each window row points at, chosen with `Tab`.
     ///
-    /// In memory only: it is a within-session habit, not a reading position,
-    /// and a stale entry would quietly redirect a message after a restart.
-    last_message_pane: HashMap<TopologyNodeKey, String>,
+    /// Only `Tab` writes here. Visiting the window, messaging an agent in it
+    /// or jumping into a pane all leave it alone: the operator said where the
+    /// row points, and it keeps pointing there until they say otherwise.
+    ///
+    /// In memory, and keyed by window: it is a pointer into a live topology,
+    /// not something worth restoring days later aimed at a pane that has
+    /// since become someone else. A window with no entry points at its first
+    /// agent pane.
+    window_pane_choice: HashMap<WindowKey, String>,
     /// Explicitly expanded session/window keys. Pane keys are leaves and never
     /// enter this set. Keys survive refresh and sort because they include the
     /// complete host+socket ancestry.
@@ -3822,7 +3749,7 @@ impl App {
             read_marks: ReadMarks::load(None),
             #[cfg(not(test))]
             read_marks: ReadMarks::load(muxa::paths::default_watch_read_file()),
-            last_message_pane: HashMap::new(),
+            window_pane_choice: HashMap::new(),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
             filtered_selection_anchor: None,
@@ -5380,6 +5307,57 @@ impl App {
             .collect()
     }
 
+    /// The window the cursor's row stands for: a window row, or the session
+    /// row a single-window session was folded into. A pane row answers `None`
+    /// — it already names one agent, so there is nothing to choose.
+    fn cursor_window(&self) -> Option<&WindowNode> {
+        let target = self.selected_tree_target()?;
+        let node = self.topology.find(&target.key)?;
+        target_window(&target, node)
+    }
+
+    /// Which pane a window row points at: the operator's `Tab` choice while
+    /// that pane still holds a live agent, else the window's first one.
+    fn window_choice<'a>(&self, window: &'a WindowNode) -> Option<&'a PaneNode> {
+        let panes = window_agent_panes(window);
+        self.window_pane_choice
+            .get(&window.key)
+            .and_then(|chosen| panes.iter().find(|pane| &pane.key.pane_id == chosen))
+            .or_else(|| panes.first())
+            .copied()
+    }
+
+    /// `Tab`: point the cursor's window at its next agent pane.
+    ///
+    /// The cursor does not move. A window holding one agent has nothing to
+    /// cycle, and says so rather than appearing to do something.
+    fn cycle_window_choice(&mut self) -> ActionOutcome {
+        let Some(window) = self.cursor_window() else {
+            return ActionOutcome::Err("this row has no window to choose a pane in".into());
+        };
+        let panes: Vec<String> = window_agent_panes(window)
+            .into_iter()
+            .map(|pane| pane.key.pane_id.clone())
+            .collect();
+        if panes.len() < 2 {
+            return ActionOutcome::Err("this window has only one agent".into());
+        }
+        let key = window.key.clone();
+        let current = self
+            .window_choice(window)
+            .map_or(0, |pane| {
+                panes
+                    .iter()
+                    .position(|id| id == &pane.key.pane_id)
+                    .unwrap_or(0)
+            });
+        let next = (current + 1) % panes.len();
+        let chosen = panes[next].clone();
+        let label = self.pane_label(&chosen);
+        self.window_pane_choice.insert(key, chosen.clone());
+        ActionOutcome::Ok(format!("{chosen} · {label}"))
+    }
+
     /// Every live agent the selected row stands for, as `(pane, session id)`.
     ///
     /// A window row stands for its panes, and a session row for every pane
@@ -5395,31 +5373,6 @@ impl App {
                     return None;
                 }
                 Some((pane.key.pane_id.clone(), agent.session_id.clone()))
-            })
-            .collect()
-    }
-
-    /// Every live agent pane the selected row covers, in roster order — the
-    /// ring `Ctrl-D` walks. A pane row answers with itself; a window or
-    /// session row answers with everything beneath it.
-    fn composer_recipients(&self) -> Vec<ComposerRecipient> {
-        self.selected_topology_panes()
-            .into_iter()
-            .filter(|pane| {
-                pane.agent
-                    .as_ref()
-                    .is_some_and(|agent| agent.state != AgentState::Stopped)
-            })
-            .filter_map(|pane| {
-                Some(ComposerRecipient {
-                    pane: pane.key.pane_id.clone(),
-                    pane_key: Some(pane.key.clone()),
-                    label: format!(
-                        "{} · {}",
-                        topology_pane_peer_label(pane)?,
-                        self.pane_label(&pane.key.pane_id)
-                    ),
-                })
             })
             .collect()
     }
@@ -8682,17 +8635,8 @@ pub async fn run(
                 }
                 Action::SubmitCollaboration => {
                     if let Some(composer) = app.collaboration_composer.take() {
-                        // Read the destination off the composer before it is
-                        // consumed: a delivered message is what makes a pane
-                        // this row's default, so `m` comes back to whoever the
-                        // operator was actually talking to.
-                        let destination = composer.destination();
                         let (outcome, report) =
                             run_watch_collaboration_composer(client, composer).await;
-                        if let (ActionOutcome::Ok(_), Some((node, pane))) = (&outcome, destination)
-                        {
-                            app.last_message_pane.insert(node, pane);
-                        }
                         if let Some(report) = report.as_ref() {
                             // A delivered recipient consumes its mark; a failed
                             // one keeps it, so the retry is the same key press
@@ -9539,28 +9483,28 @@ fn peer_choice_hint(labels: &[String]) -> String {
 /// sender is the operator console, not that pane's agent, so there is no
 /// self-send to guard against — and the row the operator was sitting on when
 /// they hit the key is a likely thing to want to poke.
-/// How a tracked pane names itself to the composer: `claude@%21 · <row>`.
-fn topology_pane_peer_label(pane: &PaneNode) -> Option<String> {
-    let agent = pane.agent.as_ref()?;
-    Some(format!(
-        "{}@{} · {}",
-        agent.kind,
-        pane.key.pane_id,
-        topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
-    ))
-}
-
 fn host_scope_target(app: &App) -> Option<(String, String, Option<PaneKey>)> {
     if app.collaboration_scope != muxa::config::CollaborationScope::Host {
         return None;
     }
     if app.uses_tree() {
-        let pane = app.selected_topology_panes().into_iter().find(|pane| {
-            pane.agent
-                .as_ref()
-                .is_some_and(|agent| agent.state != AgentState::Stopped)
-        })?;
-        let label = topology_pane_peer_label(pane)?;
+        // A window row points wherever `Tab` left it; everything else keeps
+        // resolving to the first live pane beneath the cursor.
+        let pane = match app.cursor_window() {
+            Some(window) => app.window_choice(window)?,
+            None => app.selected_topology_panes().into_iter().find(|pane| {
+                pane.agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.state != AgentState::Stopped)
+            })?,
+        };
+        let agent = pane.agent.as_ref()?;
+        let label = format!(
+            "{}@{} · {}",
+            agent.kind,
+            pane.key.pane_id,
+            topology_key_label(&TopologyNodeKey::Pane(pane.key.clone()))
+        );
         return Some((pane.key.pane_id.clone(), label, Some(pane.key.clone())));
     }
     let selected = app.selected_target()?;
@@ -9942,54 +9886,17 @@ fn open_watch_collaboration_composer(app: &mut App) {
     // while positions are legible and drift.
     let label = format!("{peer_label} · {}", app.pane_label(&peer_pane));
     let defaults = app.collaboration_compose_defaults;
-    let origin_node = app.selected_node_key();
-    let mut recipients = app.composer_recipients();
-    // A ring that does not contain the pane the cursor resolved to is not
-    // this row's ring — window scope, or a target the topology cannot see.
-    // Fall back to the single recipient rather than offer a wrong cycle.
-    match recipients
-        .iter_mut()
-        .find(|entry| entry.pane == peer_pane)
-    {
-        // The cursor's own resolution wins for its own entry. It carries the
-        // room's idea of the pane key, which is not always the topology's,
-        // and opening the composer must stay byte-identical to before.
-        Some(entry) => {
-            entry.pane_key.clone_from(&pane_key);
-            entry.label.clone_from(&label);
-        }
-        None => {
-            recipients = vec![ComposerRecipient {
-                pane: peer_pane.clone(),
-                pane_key: pane_key.clone(),
-                label: label.clone(),
-            }];
-        }
-    }
-    // Whoever this row was last messaged wins over whoever sorts first. The
-    // operator asked this window a question a minute ago; `m` should not
-    // silently address a different agent in it.
-    let selected = origin_node
-        .as_ref()
-        .and_then(|node| app.last_message_pane.get(node))
-        .and_then(|pane| recipients.iter().position(|entry| entry.pane == *pane))
-        .or_else(|| recipients.iter().position(|entry| entry.pane == peer_pane))
-        .unwrap_or(0);
-    let chosen = recipients[selected].clone();
-    app.collaboration_composer = Some(
-        CollaborationComposer::new(
-            CollaborationComposeTarget::Send {
-                origin,
-                target: format!("pane:{}", chosen.pane),
-                pane: chosen.pane,
-                pane_key: chosen.pane_key,
-                kind: defaults.kind,
-                mode: defaults.mode,
-            },
-            chosen.label,
-        )
-        .with_recipients(recipients, selected, origin_node),
-    );
+    app.collaboration_composer = Some(CollaborationComposer::new(
+        CollaborationComposeTarget::Send {
+            origin,
+            target: format!("pane:{peer_pane}"),
+            pane: peer_pane,
+            pane_key,
+            kind: defaults.kind,
+            mode: defaults.mode,
+        },
+        label,
+    ));
 }
 
 async fn run_watch_collaboration_composer(
@@ -10981,6 +10888,18 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             if modifiers.contains(KeyModifiers::CONTROL) && app.browse_keys_active() =>
         {
             app.move_half_page_down();
+            Action::None
+        }
+        // `Tab` picks which agent of a window the row points at, without
+        // moving the cursor off the window. The tree keeps its own keys for
+        // descending; this is about where `m` sends and which pane the live
+        // layout lights, both of which belong to the window row.
+        KeyCode::Tab if app.browse_keys_active() => {
+            match app.cycle_window_choice() {
+                ActionOutcome::Ok(message) => app.set_hint(format!("→ {message}"), HintLevel::Ok),
+                ActionOutcome::Err(reason) => app.set_hint(reason, HintLevel::Warn),
+                ActionOutcome::HelpToggled => {}
+            }
             Action::None
         }
         KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => Action::Refresh,
@@ -12412,21 +12331,6 @@ fn handle_collaboration_composer_event(
         KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
                 composer.delete_word_left();
-            }
-            Action::None
-        }
-        // `Ctrl-D`, not `Tab`: `Tab` and `Shift-Tab` already cycle the kind
-        // and the mode, and no macOS chord sends `\x04` the way `Cmd+Right`
-        // sends `Ctrl-E` — so this one cannot be pressed by accident while
-        // editing the line.
-        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-            let moved = app
-                .collaboration_composer
-                .as_mut()
-                .and_then(CollaborationComposer::next_recipient);
-            match moved {
-                Some(label) => app.set_hint(format!("to {label}"), HintLevel::Ok),
-                None => app.set_hint("this row has only one agent", HintLevel::Warn),
             }
             Action::None
         }
@@ -14222,26 +14126,6 @@ fn render_broadcast_report(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// The `Ctrl-D` hint, and only when there is somewhere to cycle to. A window
-/// holding one agent must not advertise a key that would do nothing.
-fn recipient_cycle_spans(
-    composer: &CollaborationComposer,
-    theme: WatchThemeSpec,
-) -> Vec<Span<'static>> {
-    if composer.recipients.len() < 2 {
-        return Vec::new();
-    }
-    vec![
-        Span::raw(" "),
-        Span::styled(" Ctrl-D ", theme.key_badge()),
-        Span::raw(format!(
-            "pane {}/{} ",
-            composer.recipient + 1,
-            composer.recipients.len()
-        )),
-    ]
-}
-
 fn collaboration_composer_title(
     composer: &CollaborationComposer,
     theme: WatchThemeSpec,
@@ -14303,11 +14187,7 @@ fn collaboration_composer_title(
                     Span::raw("kind  "),
                     Span::styled(" Shift-Tab ", theme.key_badge()),
                     Span::raw("mode "),
-                ]
-                .into_iter()
-                .chain(recipient_cycle_spans(composer, theme))
-                .collect::<Vec<_>>(),
-                ),
+                ]),
                 border,
             )
         }
@@ -16646,7 +16526,7 @@ fn render_window_mosaic_cell(
     captured: &CapturedWindowPane,
     theme: WatchThemeSpec,
     spin: Spinner,
-    destination: Option<MosaicDestination<'_>>,
+    chosen: Option<&str>,
 ) {
     let pane = window
         .panes
@@ -16657,23 +16537,22 @@ fn render_window_mosaic_cell(
         || ("○", theme.dim_style()),
         |agent| state_marker(agent.state, theme, spin),
     );
-    // While composing, only the destination is lit: two highlights meaning two
-    // different things in one grid is worse than losing sight of the active
-    // pane for as long as the composer is open.
-    let lit = destination.map_or(captured.geometry.active, |target| {
-        target.pane == captured.geometry.pane_id
-    });
-    let pane_style = if !lit {
-        Style::default()
-    } else if destination.is_some() {
-        theme.action_badge().add_modifier(Modifier::BOLD)
-    } else {
-        theme.accent_badge()
-    };
     let mut title = vec![
         Span::raw(" "),
         Span::styled(glyph.to_string(), state_style),
-        Span::styled(format!(" {}", captured.geometry.pane_id), pane_style),
+        Span::styled(
+            format!(" {}", captured.geometry.pane_id),
+            // The operator's pick, not tmux's. tmux's active pane says where
+            // the cursor would land on a jump, which has nothing to do with
+            // the row under the cursor here — so it looked arbitrary, and
+            // moved on its own. This is the pane `m` will address, and only
+            // `Tab` moves it.
+            if chosen.is_some_and(|pane| pane == captured.geometry.pane_id) {
+                theme.accent_badge()
+            } else {
+                Style::default()
+            },
+        ),
     ];
     if rect.width >= 18 {
         let detail = agent.map_or_else(
@@ -16752,31 +16631,6 @@ fn render_window_mosaic_cell(
     );
 }
 
-/// Where an open composer is pointing, for the mosaic to show.
-///
-/// The grid already highlights tmux's active pane, which answers "where does
-/// the cursor land if I jump". While a message is being written the useful
-/// question is a different one — "where does Enter send it" — and `Ctrl-D`
-/// moves that answer without moving tmux's. So during composition the
-/// destination takes the highlight over, in the action colour rather than the
-/// accent, and the header says which question is being answered.
-#[derive(Debug, Clone, Copy)]
-struct MosaicDestination<'a> {
-    pane: &'a str,
-    cycles: bool,
-}
-
-fn composer_mosaic_destination(app: &App) -> Option<MosaicDestination<'_>> {
-    let composer = app.collaboration_composer.as_ref()?;
-    let CollaborationComposeTarget::Send { pane, .. } = &composer.target else {
-        return None;
-    };
-    Some(MosaicDestination {
-        pane: pane.as_str(),
-        cycles: composer.recipients.len() > 1,
-    })
-}
-
 fn render_window_mosaic(
     f: &mut Frame,
     area: Rect,
@@ -16784,22 +16638,23 @@ fn render_window_mosaic(
     capture: &CapturedWindow,
     theme: WatchThemeSpec,
     spin: Spinner,
-    destination: Option<MosaicDestination<'_>>,
+    chosen: Option<&str>,
 ) {
     f.render_widget(Clear, area);
     let header = Rect { height: 1, ..area };
-    let subtitle = match destination {
-        Some(MosaicDestination { pane, cycles: true }) => format!("  → {pane} · Ctrl-D next"),
-        Some(MosaicDestination {
-            pane,
-            cycles: false,
-        }) => format!("  → {pane}"),
-        None => "  pane geometry · 1s refresh".to_string(),
-    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("live layout", theme.accent_badge()),
-            Span::styled(subtitle, theme.dim_style()),
+            // Only a window holding more than one agent has a choice to
+            // make, so only that one advertises the key.
+            Span::styled(
+                if window_agent_panes(window).len() > 1 {
+                    "  selected pane · Tab to change"
+                } else {
+                    "  pane geometry · 1s refresh"
+                },
+                theme.dim_style(),
+            ),
         ])),
         header,
     );
@@ -16835,7 +16690,7 @@ fn render_window_mosaic(
         let Some(rect) = rect else {
             continue;
         };
-        render_window_mosaic_cell(f, rect, window, captured, theme, spin, destination);
+        render_window_mosaic_cell(f, rect, window, captured, theme, spin, chosen);
     }
 }
 
@@ -17262,6 +17117,7 @@ fn render_topology_inspector(
             matching_window_capture(app, window),
             window_mosaic_area(area, window),
         ) {
+            let chosen = app.window_choice(window).map(|pane| pane.key.pane_id.clone());
             render_window_mosaic(
                 f,
                 mosaic_area,
@@ -17269,7 +17125,7 @@ fn render_topology_inspector(
                 capture,
                 theme,
                 spin,
-                composer_mosaic_destination(app),
+                chosen.as_deref(),
             );
         }
     }
@@ -17571,6 +17427,20 @@ fn tree_node_states(node: TopologyNodeRef<'_>) -> Vec<AgentState> {
             .map(|agent| vec![agent.state])
             .unwrap_or_default(),
     }
+}
+
+/// The panes of a window that hold a live agent, in roster order. The order
+/// is what makes "the first one" a stable default rather than a guess.
+fn window_agent_panes(window: &WindowNode) -> Vec<&PaneNode> {
+    window
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane.agent
+                .as_ref()
+                .is_some_and(|agent| agent.state != AgentState::Stopped)
+        })
+        .collect()
 }
 
 fn target_window<'a>(target: &TreeTarget, node: TopologyNodeRef<'a>) -> Option<&'a WindowNode> {
@@ -20076,6 +19946,7 @@ mod tests {
         target.key
     }
 
+
     fn composer_pane(app: &App) -> String {
         let Some(CollaborationComposeTarget::Send { pane, .. }) =
             app.collaboration_composer.as_ref().map(|c| &c.target)
@@ -20085,93 +19956,72 @@ mod tests {
         pane.clone()
     }
 
-    /// `m` on a window row used to address whichever pane sorted first, and
-    /// the other agents in that window were unreachable without descending
-    /// the tree. `Ctrl-D` walks the row instead.
+    /// The window row points at one of its agents, `Tab` moves the pointer,
+    /// and `m` follows it. Before this the row addressed whichever pane
+    /// sorted first and the other agent was unreachable from that row.
     #[test]
-    fn ctrl_d_cycles_the_composer_through_the_panes_of_a_row() {
+    fn tab_moves_which_pane_a_window_row_points_at() {
         let mut app = two_pane_window_app();
         select_window_row(&mut app);
+        let first = app
+            .cursor_window()
+            .and_then(|window| app.window_choice(window))
+            .expect("a window row points somewhere")
+            .key
+            .pane_id
+            .clone();
+        assert_eq!(first, "%21", "the default is the window's first agent");
 
         open_watch_collaboration_composer(&mut app);
-        assert_eq!(composer_pane(&app), "%21", "the first pane still opens");
-
-        let composer = app.collaboration_composer.as_ref().expect("composer open");
-        assert_eq!(composer.recipients.len(), 2, "both panes are reachable");
-
-        handle_collaboration_composer_event(
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-            &mut app,
-        );
-        assert_eq!(composer_pane(&app), "%32");
-        let composer = app.collaboration_composer.as_ref().expect("composer open");
-        assert!(
-            composer.label.contains("%32"),
-            "the title has to say who it is now addressing, got {:?}",
-            composer.label
-        );
-
-        // Forward only, and wrapping.
-        handle_collaboration_composer_event(
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-            &mut app,
-        );
         assert_eq!(composer_pane(&app), "%21");
-    }
-
-    /// A pane row names one agent outright, so there is nothing to cycle and
-    /// the footer must not advertise a key that would do nothing.
-    #[test]
-    fn a_pane_row_composer_has_nothing_to_cycle() {
-        let mut app = two_pane_window_app();
-        let index = app
-            .tree_targets()
-            .iter()
-            .position(|target| matches!(&target.key, TopologyNodeKey::Pane(key) if key.pane_id == "%32"))
-            .expect("the pane row is visible");
-        app.table_state.select(Some(index));
-
-        open_watch_collaboration_composer(&mut app);
-
-        let composer = app.collaboration_composer.as_ref().expect("composer open");
-        assert_eq!(composer.recipients.len(), 1);
-        assert_eq!(composer_pane(&app), "%32");
-        assert!(recipient_cycle_spans(composer, watch_theme(WatchTheme::Classic)).is_empty());
-    }
-
-    /// The point of remembering: the operator messaged `%32` from this row, so
-    /// the next `m` on it opens on `%32` rather than back on whoever sorts
-    /// first.
-    #[test]
-    fn m_returns_to_the_pane_this_row_was_last_messaged() {
-        let mut app = two_pane_window_app();
-        let row = select_window_row(&mut app);
-
-        open_watch_collaboration_composer(&mut app);
-        handle_collaboration_composer_event(
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-            &mut app,
-        );
-        let destination = app
-            .collaboration_composer
-            .as_ref()
-            .expect("composer open")
-            .destination()
-            .expect("a single-pane send has a destination");
-        assert_eq!(destination, (row, "%32".to_string()));
-
-        // What the submit path does once the daemon accepts the request.
-        app.last_message_pane
-            .insert(destination.0.clone(), destination.1.clone());
         app.collaboration_composer = None;
 
+        assert!(matches!(app.cycle_window_choice(), ActionOutcome::Ok(_)));
+        let chosen = app
+            .cursor_window()
+            .and_then(|window| app.window_choice(window))
+            .expect("still pointing")
+            .key
+            .pane_id
+            .clone();
+        assert_eq!(chosen, "%32", "Tab moved the pointer");
+
         open_watch_collaboration_composer(&mut app);
-        assert_eq!(composer_pane(&app), "%32");
-        let composer = app.collaboration_composer.as_ref().expect("composer open");
-        assert_eq!(composer.recipient, 1, "the ring opens positioned on it");
+        assert_eq!(composer_pane(&app), "%32", "m follows the pointer");
+    }
+
+    /// The choice survives everything except another `Tab`: sending to the
+    /// agent, leaving the row, coming back. The operator said where the row
+    /// points and nothing else gets to move it.
+    #[test]
+    fn only_tab_moves_the_pointer() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+        app.cycle_window_choice();
+
+        // Messaging it, and arriving at the other pane, both leave it alone.
+        app.mark_window_read("%21");
+        app.mark_pane_read("%21");
+
+        let chosen = app
+            .cursor_window()
+            .and_then(|window| app.window_choice(window))
+            .expect("still pointing")
+            .key
+            .pane_id
+            .clone();
+        assert_eq!(chosen, "%32");
+
+        // And it wraps rather than sticking at the end.
+        app.cycle_window_choice();
+        let wrapped = app
+            .cursor_window()
+            .and_then(|window| app.window_choice(window))
+            .expect("still pointing")
+            .key
+            .pane_id
+            .clone();
+        assert_eq!(wrapped, "%21");
     }
 
     /// `Space` on a window row has to mean "this window", not "whichever pane
@@ -20217,30 +20067,6 @@ mod tests {
             .map(|(pane, _)| pane)
             .collect();
         assert_eq!(panes, ["%21", "%32"]);
-    }
-
-    /// While a message is being written the mosaic must answer "where does
-    /// Enter send this", not "where is tmux's cursor" — and `Ctrl-D` has to
-    /// move that answer.
-    #[test]
-    fn the_live_layout_follows_the_composer_destination() {
-        let mut app = two_pane_window_app();
-        assert!(
-            composer_mosaic_destination(&app).is_none(),
-            "with no composer the grid keeps showing tmux's active pane"
-        );
-
-        select_window_row(&mut app);
-        open_watch_collaboration_composer(&mut app);
-
-        let destination = composer_mosaic_destination(&app).expect("a send composer points at one");
-        assert_eq!(destination.pane, "%21");
-        assert!(destination.cycles, "two panes means Ctrl-D is worth naming");
-
-        handle_collaboration_composer_event(KeyCode::Char('d'), KeyModifiers::CONTROL, &mut app);
-
-        let destination = composer_mosaic_destination(&app).expect("still composing");
-        assert_eq!(destination.pane, "%32", "Ctrl-D moved the highlight");
     }
 
     /// Jumping into a window puts every pane of it on screen, so coming back
@@ -22194,7 +22020,9 @@ mod tests {
             .collect::<Vec<_>>();
         let screen = rows.join("\n");
 
-        assert!(screen.contains("live layout  pane geometry · 1s refresh"));
+        // Two agents in the window, so the header offers the choice rather
+        // than describing the grid.
+        assert!(screen.contains("live layout  selected pane · Tab to change"));
         assert!(screen.contains("LEFT CAPTURE"));
         assert!(screen.contains("RIGHT CAPTURE"));
         let capture_row = rows
@@ -30524,7 +30352,7 @@ sort = ["state"]
         assert!(body.contains("u / U · Alt-A  unread on row / all read · attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / M / Space  message selected or marked / mailbox / mark agent"));
+        assert!(body.contains("m / M / Space  message / mailbox / mark · Tab picks the window’s pane"));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
