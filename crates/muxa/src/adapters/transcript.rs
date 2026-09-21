@@ -173,9 +173,12 @@ fn classify_transcript_line(line: &str) -> Option<TurnOutcome> {
         });
     }
 
-    // Form 2: a `tool_result` whose text contains "You've hit your
-    // limit". Subagent rate-limits propagate to the parent transcript
-    // as user-role tool_result entries without the structured fields.
+    // Form 2: a short `tool_result` reporting "You've hit your limit".
+    // Subagent rate-limits propagate to the parent transcript as
+    // user-role tool_result entries without the structured fields, so
+    // this path has only the text to go on — see
+    // `tool_result_reports_rate_limit` for what keeps that from firing
+    // on a tool that merely quotes the phrase.
     if v.get("type")?.as_str()? == "user" {
         let content = v.get("message")?.get("content")?.as_array()?;
         for c in content {
@@ -193,13 +196,31 @@ fn classify_transcript_line(line: &str) -> Option<TurnOutcome> {
                     .join("\n"),
                 _ => continue,
             };
-            if text.contains("You've hit your limit") || text.contains("Claude usage limit reached")
-            {
+            if tool_result_reports_rate_limit(&text) {
                 return Some(TurnOutcome::RateLimited(text));
             }
         }
     }
     None
+}
+
+/// Does a `tool_result`'s text actually *report* a rate limit, as opposed
+/// to merely quoting the phrase?
+///
+/// The subagent path (Form 2) has no structured `error`/`apiErrorStatus`
+/// field to key on — only the text — so a bare `contains` check fired on
+/// anything that mentioned the sentence, including a `grep`/`cat` of
+/// Muxa's own rate-limit code or docs. The synthetic message Claude Code
+/// writes *is* the sentence: it leads its (trimmed) line. A tool that
+/// quotes the phrase always buries it mid-line — behind a line number, a
+/// `///` comment marker, an `if text.contains(...)`, prose like
+/// "of them hits `You've hit your limit`". Anchoring the match to the
+/// start of a trimmed line keeps the real signal and drops the quotes.
+fn tool_result_reports_rate_limit(text: &str) -> bool {
+    text.lines().map(str::trim_start).any(|line| {
+        line.starts_with("You've hit your limit")
+            || line.starts_with("Claude usage limit reached")
+    })
 }
 
 /// Session-level summary signals captured from the transcript tail.
@@ -421,6 +442,44 @@ mod tests {
     fn legacy_usage_limit_phrasing_classified_as_rate_limited() {
         let f = write(&[
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Claude usage limit reached. Your limit will reset at 2pm (America/New_York)"}]}}"#,
+        ]);
+        assert!(matches!(
+            last_turn_outcome(f.path()),
+            Some(TurnOutcome::RateLimited(_))
+        ));
+    }
+
+    /// A `tool_result` that merely *quotes* the rate-limit sentence —
+    /// a grep/cat of Muxa's own code or docs — must not read as a real
+    /// cap. Every quoting shape buries the phrase mid-line, behind a
+    /// line number, a comment marker, or prose; only the synthetic
+    /// message leads its line. Regression for this session going `error`
+    /// each time it read the rate-limit source.
+    #[test]
+    fn tool_result_quoting_the_phrase_is_not_a_rate_limit() {
+        for quote in [
+            r#"of them hits `You've hit your limit · resets 2:40pm`, and the session sits"#,
+            r#"58:    /// before the failure (e.g., `\"You've hit your limit · resets …\"`)."#,
+            r#"if text.contains(\"You've hit your limit\") || text.contains(\"Claude usage limit reached\")"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":"{quote}"}}]}}}}"#
+            );
+            let f = write(&[line.as_str()]);
+            assert_eq!(
+                last_turn_outcome(f.path()),
+                None,
+                "quoting the phrase must not classify as rate-limited: {quote}"
+            );
+        }
+    }
+
+    /// The synthetic message still fires even with leading whitespace on
+    /// the line — trimming is part of the anchor.
+    #[test]
+    fn tool_result_leading_whitespace_still_a_rate_limit() {
+        let f = write(&[
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"   You've hit your limit · resets 6pm"}]}}"#,
         ]);
         assert!(matches!(
             last_turn_outcome(f.path()),
