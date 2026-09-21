@@ -5343,19 +5343,29 @@ impl App {
             return ActionOutcome::Err("this window has only one agent".into());
         }
         let key = window.key.clone();
-        let current = self
-            .window_choice(window)
-            .map_or(0, |pane| {
-                panes
-                    .iter()
-                    .position(|id| id == &pane.key.pane_id)
-                    .unwrap_or(0)
-            });
+        let current = self.window_choice(window).map_or(0, |pane| {
+            panes
+                .iter()
+                .position(|id| id == &pane.key.pane_id)
+                .unwrap_or(0)
+        });
         let next = (current + 1) % panes.len();
         let chosen = panes[next].clone();
         let label = self.pane_label(&chosen);
+        // tmux's focused pane and this choice are one thing, not two. Without
+        // this they drift apart the moment `Tab` moves: the roster would send
+        // to one pane while jumping into the window landed on another, which
+        // is the split the merge exists to close. `select-pane` on a window
+        // the operator is not looking at only moves that window's remembered
+        // cursor — no view moves, no process notices.
+        let focused = focus_chosen_pane(&key, &chosen);
         self.window_pane_choice.insert(key, chosen.clone());
-        ActionOutcome::Ok(format!("{chosen} · {label}"))
+        match focused {
+            Ok(()) => ActionOutcome::Ok(format!("{chosen} · {label}")),
+            // The choice still stands; only tmux refused. Say so rather than
+            // letting the two fall silently out of step.
+            Err(error) => ActionOutcome::Err(format!("{chosen} selected, tmux refused: {error}")),
+        }
     }
 
     /// Every live agent the selected row stands for, as `(pane, session id)`.
@@ -5428,12 +5438,7 @@ impl App {
             .sessions
             .iter()
             .flat_map(|session| &session.windows)
-            .find(|window| {
-                window
-                    .panes
-                    .iter()
-                    .any(|pane| pane.key.pane_id == pane_id)
-            })
+            .find(|window| window.panes.iter().any(|pane| pane.key.pane_id == pane_id))
             .map(|window| {
                 window
                     .panes
@@ -9701,10 +9706,7 @@ fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
 }
 
 /// Mark or unmark every agent a parent row stands for.
-fn toggle_row_collaboration_marks(
-    app: &mut App,
-    row: Vec<(String, String)>,
-) -> ActionOutcome {
+fn toggle_row_collaboration_marks(app: &mut App, row: Vec<(String, String)>) -> ActionOutcome {
     let already = |app: &App, pane: &str, session: &str| {
         app.collaboration_marks.iter().any(|mark| {
             mark.pane == pane
@@ -12375,9 +12377,7 @@ fn handle_collaboration_composer_event(
         // ALT is excluded alongside CONTROL: an unhandled `Alt-<char>` is a
         // chord, not text. Without this `Opt+Left` (which arrives as `Alt-b`)
         // typed a literal "b" into the message.
-        KeyCode::Char(c)
-            if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
+        KeyCode::Char(c) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
                 composer.insert(c);
             }
@@ -16081,10 +16081,11 @@ fn inspector_pane_roster_line_with_prefix(
             cols.name_end.saturating_sub(prefix_width),
             &pane.key.pane_id,
         );
-        push_at(&mut body, cols.latest.saturating_sub(prefix_width), &format!(
-            "{} · {} · {}",
-            pane.current_command, pane.title, pane.cwd
-        ));
+        push_at(
+            &mut body,
+            cols.latest.saturating_sub(prefix_width),
+            &format!("{} · {} · {}", pane.current_command, pane.title, pane.cwd),
+        );
         let rest: String = body.chars().skip(1).collect();
         return Line::from(vec![
             Span::styled(prefix, theme.dim_style()),
@@ -16526,13 +16527,16 @@ fn render_window_mosaic_cell(
     captured: &CapturedWindowPane,
     theme: WatchThemeSpec,
     spin: Spinner,
-    chosen: Option<&str>,
+    focus: MosaicFocus<'_>,
 ) {
     let pane = window
         .panes
         .iter()
         .find(|pane| pane.key.pane_id == captured.geometry.pane_id);
     let agent = pane.and_then(|pane| pane.agent.as_ref());
+    let is_chosen = focus
+        .chosen
+        .is_some_and(|pane| pane == captured.geometry.pane_id);
     let (glyph, state_style) = agent.map_or_else(
         || ("○", theme.dim_style()),
         |agent| state_marker(agent.state, theme, spin),
@@ -16542,12 +16546,9 @@ fn render_window_mosaic_cell(
         Span::styled(glyph.to_string(), state_style),
         Span::styled(
             format!(" {}", captured.geometry.pane_id),
-            // The operator's pick, not tmux's. tmux's active pane says where
-            // the cursor would land on a jump, which has nothing to do with
-            // the row under the cursor here — so it looked arbitrary, and
-            // moved on its own. This is the pane `m` will address, and only
-            // `Tab` moves it.
-            if chosen.is_some_and(|pane| pane == captured.geometry.pane_id) {
+            // The operator's pick. `Tab` moves it and moves tmux's focus with
+            // it, so this is both where `m` sends and where a jump lands.
+            if is_chosen {
                 theme.accent_badge()
             } else {
                 Style::default()
@@ -16575,19 +16576,12 @@ fn render_window_mosaic_cell(
         return;
     }
 
-    let border_style = agent.map_or_else(
-        || theme.border_style(),
-        |agent| {
-            if agent_needs_attention(agent.state) || captured.geometry.active {
-                theme.state_style(agent.state).add_modifier(Modifier::BOLD)
-            } else {
-                theme.border_style()
-            }
-        },
-    );
+    let border_style = mosaic_border_style(agent, is_chosen, focus.unread, theme);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(if captured.geometry.active {
+        // Double for the chosen pane, so "unread" (colour) and "pointing
+        // here" (line) stay separable when one pane is both.
+        .border_type(if is_chosen {
             BorderType::Double
         } else {
             theme.border_type
@@ -16631,6 +16625,15 @@ fn render_window_mosaic_cell(
     );
 }
 
+/// What the live layout needs to know about the operator rather than the
+/// window: which pane the row points at, and which agents have output the
+/// operator has not read.
+#[derive(Clone, Copy)]
+struct MosaicFocus<'a> {
+    chosen: Option<&'a str>,
+    unread: &'a HashSet<String>,
+}
+
 fn render_window_mosaic(
     f: &mut Frame,
     area: Rect,
@@ -16638,7 +16641,7 @@ fn render_window_mosaic(
     capture: &CapturedWindow,
     theme: WatchThemeSpec,
     spin: Spinner,
-    chosen: Option<&str>,
+    focus: MosaicFocus<'_>,
 ) {
     f.render_widget(Clear, area);
     let header = Rect { height: 1, ..area };
@@ -16690,7 +16693,7 @@ fn render_window_mosaic(
         let Some(rect) = rect else {
             continue;
         };
-        render_window_mosaic_cell(f, rect, window, captured, theme, spin, chosen);
+        render_window_mosaic_cell(f, rect, window, captured, theme, spin, focus);
     }
 }
 
@@ -17117,7 +17120,9 @@ fn render_topology_inspector(
             matching_window_capture(app, window),
             window_mosaic_area(area, window),
         ) {
-            let chosen = app.window_choice(window).map(|pane| pane.key.pane_id.clone());
+            let chosen = app
+                .window_choice(window)
+                .map(|pane| pane.key.pane_id.clone());
             render_window_mosaic(
                 f,
                 mosaic_area,
@@ -17125,7 +17130,10 @@ fn render_topology_inspector(
                 capture,
                 theme,
                 spin,
-                chosen.as_deref(),
+                MosaicFocus {
+                    chosen: chosen.as_deref(),
+                    unread: &app.unread_sessions(),
+                },
             );
         }
     }
@@ -17429,6 +17437,52 @@ fn tree_node_states(node: TopologyNodeRef<'_>) -> Vec<AgentState> {
     }
 }
 
+/// What a live-layout cell's border says about its pane.
+///
+/// A coloured border means "there is something here for you": an agent that
+/// is blocked, one whose newest output has not been read, or the pane this
+/// row is pointing at. A working agent stays grey on purpose — it is busy,
+/// not waiting on anybody, and colouring it would spend the operator's
+/// attention on the one state that resolves itself.
+///
+/// Unread wins over the state colour and wears the roster's blue, so both
+/// surfaces say the same thing about the same agent. The chosen pane is
+/// marked by the border *line* rather than its colour, which keeps the two
+/// separable when one pane is both.
+fn mosaic_border_style(
+    agent: Option<&Agent>,
+    is_chosen: bool,
+    unread: &HashSet<String>,
+    theme: WatchThemeSpec,
+) -> Style {
+    let Some(agent) = agent else {
+        return theme.border_style();
+    };
+    if agent.state == AgentState::Idle && unread.contains(&agent.session_id) {
+        theme.unread_idle_style()
+    } else if agent_needs_attention(agent.state) || is_chosen {
+        theme.state_style(agent.state).add_modifier(Modifier::BOLD)
+    } else {
+        theme.border_style()
+    }
+}
+
+/// Move tmux's focus onto the pane the row now points at.
+///
+/// Stubbed under `cfg(test)`. The window fixtures carry pane ids like `%21`
+/// that exist on a real developer's machine, and `cargo test` must not reach
+/// out and move somebody's cursor.
+#[cfg(not(test))]
+fn focus_chosen_pane(window: &WindowKey, pane: &str) -> std::result::Result<(), String> {
+    crate::mux_control::run(&window.session.endpoint, &["select-pane", "-t", pane])
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)] // mirrors the real signature it stands in for
+fn focus_chosen_pane(_window: &WindowKey, _pane: &str) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 /// The panes of a window that hold a live agent, in roster order. The order
 /// is what makes "the first one" a stable default rather than a guess.
 fn window_agent_panes(window: &WindowNode) -> Vec<&PaneNode> {
@@ -17512,7 +17566,10 @@ fn tree_state_cell(
     }
     let states = tree_node_states(node);
     if states.is_empty() {
-        return Text::from(Span::styled(crate::state_icon(AgentState::Idle), theme.dim_style()));
+        return Text::from(Span::styled(
+            crate::state_icon(AgentState::Idle),
+            theme.dim_style(),
+        ));
     }
     Text::from(Line::from(state_summary_gutter_spans(
         states,
@@ -18116,15 +18173,13 @@ fn render_topology_table(
                     TopologyTableColumn::State => {
                         Cell::from(tree_state_cell(target, node, &unread, theme, spin))
                     }
-                    TopologyTableColumn::Node => {
-                        Cell::from(tree_node_label(
-                            target,
-                            node,
-                            endpoint_count > 1,
-                            &marked,
-                            theme,
-                        ))
-                    }
+                    TopologyTableColumn::Node => Cell::from(tree_node_label(
+                        target,
+                        node,
+                        endpoint_count > 1,
+                        &marked,
+                        theme,
+                    )),
                     TopologyTableColumn::Age => Cell::from(tree_node_age(app, target, node, now)),
                     TopologyTableColumn::Summary => Cell::from(truncate_chars(
                         &tree_node_summary(target, node, app.watch_cfg.layout),
@@ -19830,13 +19885,19 @@ mod tests {
 
         // The agent finishes another turn.
         agent.last_activity_at += time::Duration::seconds(1);
-        assert!(marks.is_unread(&agent), "new activity must resurface the row");
+        assert!(
+            marks.is_unread(&agent),
+            "new activity must resurface the row"
+        );
 
         marks.mark_read_at(&agent.session_id, agent.last_activity_at);
         assert!(!marks.is_unread(&agent));
 
         // A stale snapshot must not drag the mark backwards and un-read it.
-        marks.mark_read_at(&agent.session_id, agent.last_activity_at - time::Duration::seconds(30));
+        marks.mark_read_at(
+            &agent.session_id,
+            agent.last_activity_at - time::Duration::seconds(30),
+        );
         assert!(!marks.is_unread(&agent));
 
         marks.mark_unread_at(&agent.session_id);
@@ -19869,7 +19930,10 @@ mod tests {
         let mut marks = ReadMarks::default();
         let base = OffsetDateTime::now_utc();
         for n in 0..u32::try_from(MAX_READ_MARKS + 10).expect("cap fits a u32") {
-            marks.mark_read_at(&format!("s{n:04}"), base + time::Duration::seconds(n.into()));
+            marks.mark_read_at(
+                &format!("s{n:04}"),
+                base + time::Duration::seconds(n.into()),
+            );
         }
         // The oldest of all, but live, so it must outlast the cap.
         let live: HashSet<String> = ["s0000".to_string()].into_iter().collect();
@@ -19946,7 +20010,6 @@ mod tests {
         target.key
     }
 
-
     fn composer_pane(app: &App) -> String {
         let Some(CollaborationComposeTarget::Send { pane, .. }) =
             app.collaboration_composer.as_ref().map(|c| &c.target)
@@ -20022,6 +20085,73 @@ mod tests {
             .pane_id
             .clone();
         assert_eq!(wrapped, "%21");
+    }
+
+    /// The border answers "is there something here for me", not "what state
+    /// is this in". Blocked, unread and the row's own pane earn a colour;
+    /// a quiet or busy agent does not.
+    #[test]
+    fn a_mosaic_border_is_coloured_only_when_it_has_something_to_say() {
+        let theme = watch_theme(WatchTheme::Classic);
+        let none: HashSet<String> = HashSet::new();
+        let agent = |state| {
+            fake_agent(
+                "s1",
+                Some("%21"),
+                AgentKind::ClaudeCode,
+                state,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let idle = agent(AgentState::Idle);
+        assert_eq!(
+            mosaic_border_style(Some(&idle), false, &none, theme),
+            theme.border_style(),
+            "a quiet agent nobody is pointing at stays grey"
+        );
+        let working = agent(AgentState::Working);
+        assert_eq!(
+            mosaic_border_style(Some(&working), false, &none, theme),
+            theme.border_style(),
+            "busy is not the same as needing me"
+        );
+        let waiting = agent(AgentState::WaitingInput);
+        assert_eq!(
+            mosaic_border_style(Some(&waiting), false, &none, theme),
+            theme
+                .state_style(AgentState::WaitingInput)
+                .add_modifier(Modifier::BOLD),
+        );
+        assert_eq!(
+            mosaic_border_style(Some(&idle), true, &none, theme),
+            theme
+                .state_style(AgentState::Idle)
+                .add_modifier(Modifier::BOLD),
+            "the pane the row points at is coloured by its state"
+        );
+
+        // Unread takes the colour, and takes it from the state.
+        let unread: HashSet<String> = [idle.session_id.clone()].into_iter().collect();
+        assert_eq!(
+            mosaic_border_style(Some(&idle), false, &unread, theme),
+            theme.unread_idle_style(),
+            "unread has to be visible without being pointed at"
+        );
+        assert_eq!(
+            mosaic_border_style(Some(&idle), true, &unread, theme),
+            theme.unread_idle_style(),
+            "being pointed at must not hide that it is unread"
+        );
+
+        assert_eq!(
+            mosaic_border_style(None, true, &none, theme),
+            theme.border_style(),
+            "a pane with no agent has nothing to report"
+        );
     }
 
     /// `Space` on a window row has to mean "this window", not "whichever pane
@@ -20201,11 +20331,7 @@ mod tests {
         assert_eq!(star_style(pane), theme.marked_style());
         assert_eq!(star_style(parent), theme.marked_rollup_style());
         assert_ne!(theme.marked_style(), theme.marked_rollup_style());
-        assert!(
-            render(parent).ends_with(" ✦2"),
-            "got {:?}",
-            render(parent)
-        );
+        assert!(render(parent).ends_with(" ✦2"), "got {:?}", render(parent));
     }
 
     /// Unread must re-colour the idle marker and change nothing else — no
@@ -21863,7 +21989,11 @@ mod tests {
                 }
             })
             .collect();
-        app.pane_capture = Some(CapturedPane::new("%1".into(), Some("default".into()), ruler));
+        app.pane_capture = Some(CapturedPane::new(
+            "%1".into(),
+            Some("default".into()),
+            ruler,
+        ));
         let pane_key = app.topology.sessions[0].windows[0].panes[0].node_key();
         select_tree_key(&mut app, &pane_key);
 
@@ -24240,15 +24370,14 @@ mod tests {
 
         open_watch_collaboration_composer(&mut app);
 
-        let Some(CollaborationComposeTarget::Broadcast { recipients, .. }) =
-            app.collaboration_composer.as_ref().map(|composer| &composer.target)
+        let Some(CollaborationComposeTarget::Broadcast { recipients, .. }) = app
+            .collaboration_composer
+            .as_ref()
+            .map(|composer| &composer.target)
         else {
             panic!("marked agents outside the room must open a broadcast");
         };
-        let panes: Vec<_> = recipients
-            .iter()
-            .map(|(pane, _)| pane.as_str())
-            .collect();
+        let panes: Vec<_> = recipients.iter().map(|(pane, _)| pane.as_str()).collect();
         assert_eq!(panes, ["%913", "%42"]);
         // The mark on a pane that no longer exists is still counted, so the
         // confirmation never claims more recipients than it addressed.
@@ -30352,7 +30481,9 @@ sort = ["state"]
         assert!(body.contains("u / U · Alt-A  unread on row / all read · attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains("m / M / Space  message / mailbox / mark · Tab picks the window’s pane"));
+        assert!(
+            body.contains("m / M / Space  message / mailbox / mark · Tab picks the window’s pane")
+        );
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
