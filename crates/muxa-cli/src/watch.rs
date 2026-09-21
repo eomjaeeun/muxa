@@ -11983,8 +11983,7 @@ fn composer_submit_action(app: &mut App) -> Action {
         .as_ref()
         .is_none_or(|composer| composer.input.trim().is_empty());
     if empty {
-        app.set_hint("message cannot be empty", HintLevel::Warn);
-        return Action::None;
+        return Action::CancelCollaborationComposer;
     }
     match app.collaboration_composer.take() {
         Some(CollaborationComposer {
@@ -23233,6 +23232,28 @@ mod tests {
 
         assert!(matches!(
             handle_collaboration_composer_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app),
+            Action::CancelCollaborationComposer
+        ));
+    }
+
+    /// Enter on an empty composer used to just warn "message cannot be
+    /// empty" and sit there. It now closes the composer instead, matching
+    /// Esc and backspace-on-empty.
+    #[test]
+    fn enter_on_an_empty_message_composer_cancels_it() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
+            Action::CancelCollaborationComposer
+        ));
+
+        // Whitespace-only input counts as empty too.
+        open_watch_collaboration_composer(&mut app);
+        app.collaboration_composer.as_mut().unwrap().insert(' ');
+        assert!(matches!(
+            handle_collaboration_composer_event(KeyCode::Enter, KeyModifiers::NONE, &mut app),
             Action::CancelCollaborationComposer
         ));
     }
