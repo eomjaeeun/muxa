@@ -50,6 +50,7 @@ pub mod event;
 pub mod fleet;
 pub mod history;
 pub mod ipc;
+pub mod keepalive;
 pub mod metrics;
 pub mod notify;
 pub mod paths;

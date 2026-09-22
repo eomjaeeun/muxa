@@ -41,6 +41,7 @@ use crate::event::{AgentEvent, PROTOCOL_VERSION};
 use crate::fleet::{
     FleetCommandResult, FleetOperation, FleetRuntime, FleetSnapshot, FleetUpdate, LabelSelector,
 };
+use crate::keepalive::{KeepaliveInfo, KeepaliveStore};
 use crate::pipeline_run::{
     PipelineAliasStatus, PipelineClaim, PipelineRun, PipelineRunRegistration, PipelineRunStore,
 };
@@ -523,6 +524,30 @@ enum RequestBody {
         rule: AutomationRule,
         pane: String,
     },
+    // --- keepalive_v1 ------------------------------------------------
+    /// Start (or replace) a periodic-Enter loop on `pane`. Answers with
+    /// the refreshed schedule list.
+    KeepaliveStart {
+        pane: String,
+        interval_secs: u64,
+    },
+    /// Stop and remove `pane`'s schedule, if any. Answers with the
+    /// refreshed schedule list.
+    KeepaliveStop {
+        pane: String,
+    },
+    /// Every live schedule. Answers in `keepalive_list`.
+    KeepaliveList {},
+    /// Hold `pane`'s schedule without removing it — `watch` sends this
+    /// right before jumping the operator into that exact pane, so an
+    /// automatic Enter never lands on something they are mid-typing.
+    /// Answers with the refreshed schedule list.
+    KeepalivePause {
+        pane: String,
+    },
+    /// Lift every pause. `watch` sends this once on startup: the operator
+    /// is back at the console. Answers with the refreshed schedule list.
+    KeepaliveResumeAll {},
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -720,6 +745,7 @@ const CAPABILITIES: &[&str] = &[
     "automation_ask_v1",
     "config_launch_v1",
     "config_edit_v1",
+    "keepalive_v1",
 ];
 
 /// Advertised only when the server has the controller required to come back
@@ -851,6 +877,9 @@ pub struct Response {
     pub automation_test: Option<AutomationTestReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automation_judgment: Option<crate::automation_judge::AutomationJudgment>,
+    /// `keepalive_v1`: every live schedule, oldest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_list: Option<Vec<KeepaliveInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<crate::config_file::LaunchSettings>,
 }
@@ -908,6 +937,7 @@ impl Response {
             automation_log: None,
             automation_test: None,
             automation_judgment: None,
+            keepalive_list: None,
             launch: None,
         }
     }
@@ -1091,6 +1121,11 @@ impl Response {
     fn with_automation_rules(rules: AutomationRules) -> Self {
         let mut response = Self::ok();
         response.automation_rules = Some(rules);
+        response
+    }
+    fn with_keepalive_list(list: Vec<KeepaliveInfo>) -> Self {
+        let mut response = Self::ok();
+        response.keepalive_list = Some(list);
         response
     }
     fn with_automation_log(entries: Vec<AutomationLedgerEntry>) -> Self {
@@ -1496,6 +1531,7 @@ pub struct Server {
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
     automation: Arc<AutomationStore>,
+    keepalive: Arc<KeepaliveStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
@@ -1520,6 +1556,7 @@ impl Server {
             collaboration_audit: CollaborationAuditLog::in_memory(),
             ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             automation: AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
+            keepalive: KeepaliveStore::in_memory(),
             restart: None,
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
@@ -1580,6 +1617,14 @@ impl Server {
     #[must_use]
     pub fn with_automation(mut self, automation: Arc<AutomationStore>) -> Self {
         self.automation = automation;
+        self
+    }
+
+    /// Install the live keepalive schedule state. Optional; the default is
+    /// an empty in-memory store, same shape as every embedder/test gets.
+    #[must_use]
+    pub fn with_keepalive(mut self, keepalive: Arc<KeepaliveStore>) -> Self {
+        self.keepalive = keepalive;
         self
     }
 
@@ -1717,6 +1762,7 @@ impl Server {
                     let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
                     let automation = self.automation.clone();
+                    let keepalive = self.keepalive.clone();
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
@@ -1736,6 +1782,7 @@ impl Server {
                                 collaboration_audit,
                                 ask,
                                 automation,
+                                keepalive,
                                 restart,
                                 fleet,
                                 pipeline_runs,
@@ -2680,6 +2727,7 @@ async fn record_collaboration_audit(
         collaboration_audit,
         ask,
         automation,
+        keepalive,
         restart,
         fleet,
         pipeline_runs,
@@ -2697,6 +2745,7 @@ async fn handle(
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
     automation: Arc<AutomationStore>,
+    keepalive: Arc<KeepaliveStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
@@ -3627,6 +3676,55 @@ async fn handle(
                         }
                         Err(error) => Response::err(error),
                     }
+                }
+                RequestBody::KeepaliveStart { pane, interval_secs } => {
+                    kind = "keepalive_start";
+                    let interval = Duration::from_secs(interval_secs.max(1));
+                    let tick_backends = backends.clone();
+                    let tick_store = store.clone();
+                    keepalive
+                        .start(pane.clone(), interval, move |pane| {
+                            let backends = tick_backends.clone();
+                            let store = tick_store.clone();
+                            async move {
+                                let Ok(target) = resolve_backend(&backends, &pane) else {
+                                    return;
+                                };
+                                if !target.caps().send_text {
+                                    return;
+                                }
+                                let agents = store.by_pane(&pane).await;
+                                let Ok(socket) = unique_pane_endpoint(&pane, &agents) else {
+                                    return;
+                                };
+                                let target = target.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    target.send_text_on(socket.as_deref(), &pane, "\r")
+                                })
+                                .await;
+                            }
+                        })
+                        .await;
+                    Response::with_keepalive_list(keepalive.list().await)
+                }
+                RequestBody::KeepaliveStop { pane } => {
+                    kind = "keepalive_stop";
+                    keepalive.stop(&pane).await;
+                    Response::with_keepalive_list(keepalive.list().await)
+                }
+                RequestBody::KeepaliveList {} => {
+                    kind = "keepalive_list";
+                    Response::with_keepalive_list(keepalive.list().await)
+                }
+                RequestBody::KeepalivePause { pane } => {
+                    kind = "keepalive_pause";
+                    keepalive.pause(&pane).await;
+                    Response::with_keepalive_list(keepalive.list().await)
+                }
+                RequestBody::KeepaliveResumeAll {} => {
+                    kind = "keepalive_resume_all";
+                    keepalive.resume_all().await;
+                    Response::with_keepalive_list(keepalive.list().await)
                 }
                 RequestBody::CollaborationSend {
                     origin,
@@ -5303,6 +5401,63 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["automation_test"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Start (or replace) a periodic-Enter loop on `pane`, ticking every
+    /// `interval_secs`.
+    pub async fn keepalive_start(
+        &self,
+        pane: &str,
+        interval_secs: u64,
+    ) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "keepalive_start",
+            "pane": pane,
+            "interval_secs": interval_secs,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Stop and remove `pane`'s schedule, if any.
+    pub async fn keepalive_stop(&self, pane: &str) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "keepalive_stop",
+            "pane": pane,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Every live schedule, oldest first.
+    pub async fn keepalive_list(&self) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "keepalive_list" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Hold `pane`'s schedule without removing it — `watch` calls this right
+    /// before jumping the operator into that exact pane.
+    pub async fn keepalive_pause(&self, pane: &str) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "keepalive_pause",
+            "pane": pane,
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Lift every pause. `watch` calls this once on startup.
+    pub async fn keepalive_resume_all(&self) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "keepalive_resume_all",
+        });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
     }
 
     /// Draft one pipeline from a description with a read-only headless
@@ -7129,6 +7284,7 @@ mod tests {
             CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
             AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
+            KeepaliveStore::in_memory(),
             None,
             None,
             PipelineRunStore::in_memory(),
@@ -7590,6 +7746,45 @@ mod tests {
         assert!(rules.rules.is_empty());
         // An unknown name is refused rather than silently succeeding.
         assert!(client.automation_remove_rule("nope").await.is_err());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepalive_schedules_start_pause_resume_and_stop_over_ipc() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-keepalive.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+
+        assert!(client.keepalive_list().await.unwrap().is_empty());
+
+        let list = client.keepalive_start("%1", 5).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pane, "%1");
+        assert_eq!(list[0].interval_secs, 5);
+        assert!(!list[0].paused);
+
+        // Starting again on the same pane replaces rather than stacking.
+        let list = client.keepalive_start("%1", 10).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].interval_secs, 10);
+
+        let list = client.keepalive_pause("%1").await.unwrap();
+        assert!(list[0].paused, "watch pauses the schedule before jumping in");
+
+        let list = client.keepalive_resume_all().await.unwrap();
+        assert!(!list[0].paused, "watch resumes everything on startup");
+
+        let list = client.keepalive_stop("%1").await.unwrap();
+        assert!(list.is_empty());
+
+        // Capability tag exists for clients that feature-gate on it.
+        assert!(CAPABILITIES.contains(&"keepalive_v1"));
 
         tx.send(()).unwrap();
         handle.await.unwrap();

@@ -1952,7 +1952,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         // One line, not two: the overlay is sized to its line count and
         // clipped by the terminal, so a row added here pushes the last
         // binding off a short screen.
-        "  C / n / w / R  shell window / agent pane / work up / rename the row",
+        "  C/n/w/R/p/P    shell window / agent pane / work up / rename / keepalive start·list",
         "  a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete",
         "",
         "Commands & inspection",
@@ -2209,6 +2209,34 @@ impl AskReader {
     fn page(&self) -> isize {
         isize::try_from(self.view_height.saturating_sub(1).max(1)).unwrap_or(1)
     }
+}
+
+/// The `p` popup: one numeric field, an interval in seconds, applied to the
+/// pane the cursor was on when it opened. Deliberately narrower than the
+/// message/ask composers — a keepalive schedule has exactly one thing to
+/// say, so it gets a small centered dialog rather than a chat-shaped panel.
+#[derive(Debug, Clone)]
+struct KeepalivePopup {
+    pane: String,
+    seconds: String,
+    cursor: usize,
+}
+
+impl KeepalivePopup {
+    fn parsed_seconds(&self) -> Option<u64> {
+        let value: u64 = self.seconds.trim().parse().ok()?;
+        (value > 0).then_some(value)
+    }
+}
+
+/// `Shift-P`'s list of live keepalive schedules, as last fetched from the
+/// daemon. Opening it always refetches — a schedule started from another
+/// terminal, or one that finished pausing, must not read stale.
+#[derive(Debug, Clone, Default)]
+struct KeepalivePanelState {
+    open: bool,
+    selected: usize,
+    entries: Vec<muxa::keepalive::KeepaliveInfo>,
 }
 
 /// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
@@ -3501,6 +3529,12 @@ pub(crate) struct App {
     rename: Option<RenameComposer>,
     ask_panel: AskPanelState,
     ask_entries: Vec<muxa::ask::AskEntry>,
+    /// `Some` while the `p` keepalive popup is open — its numeric interval
+    /// field, and which pane it will apply to.
+    keepalive_popup: Option<KeepalivePopup>,
+    /// `Shift-P`'s panel: every live schedule, as last fetched from the
+    /// daemon.
+    keepalive_panel: KeepalivePanelState,
     /// Durable conversations, newest first, and the one whose transcript the
     /// Ask panel is showing. Older daemons leave both empty and retain the
     /// legacy provider-filtered history behavior.
@@ -3796,6 +3830,8 @@ impl App {
             rename: None,
             ask_panel: AskPanelState::default(),
             ask_entries: Vec::new(),
+            keepalive_popup: None,
+            keepalive_panel: KeepalivePanelState::default(),
             ask_conversations: Vec::new(),
             active_ask_conversation_id: None,
             ask_conversations_available: false,
@@ -8125,6 +8161,12 @@ pub async fn run(
     sort_persist_path: Option<PathBuf>,
     caller_pane: Option<String>,
 ) -> Result<Option<WatchOpenTarget>> {
+    // The operator is back at the console: lift whatever `AttachPane`/
+    // `AttachTopologyPane` paused on a previous jump out of `watch`. Every
+    // launch resumes everything rather than tracking which jump caused
+    // which pause — simpler, and correct for the common case of jumping to
+    // one pane and coming straight back here.
+    let _ = client.keepalive_resume_all().await;
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
@@ -8327,12 +8369,19 @@ pub async fn run(
                 // window.
                 Action::AttachPane(pane) => {
                     app.mark_window_read(&pane);
+                    // Best-effort: the operator is about to sit in this
+                    // exact pane, so an unattended Enter landing mid-keystroke
+                    // is the one outcome a keepalive schedule must never
+                    // cause. A daemon that can't be reached leaves nothing
+                    // paused, same as before this existed.
+                    let _ = client.keepalive_pause(&pane).await;
                     jump_target = Some(WatchOpenTarget::LegacyPane(pane));
                     quit = true;
                     break;
                 }
                 Action::AttachTopologyPane(pane) => {
                     app.mark_window_read(&pane.pane_id);
+                    let _ = client.keepalive_pause(&pane.pane_id).await;
                     jump_target = Some(WatchOpenTarget::TopologyPane(pane));
                     quit = true;
                     break;
@@ -8629,6 +8678,38 @@ pub async fn run(
                         ),
                     }
                 }
+                Action::SubmitKeepalive {
+                    pane,
+                    interval_secs,
+                } => match client.keepalive_start(&pane, interval_secs).await {
+                    Ok(_) => app.set_hint(
+                        format!("keepalive: every {interval_secs}s on {pane}"),
+                        HintLevel::Ok,
+                    ),
+                    Err(e) => app.set_hint(format!("keepalive failed: {e}"), HintLevel::Err),
+                },
+                Action::OpenKeepalivePanel => match client.keepalive_list().await {
+                    Ok(entries) => {
+                        app.keepalive_panel.entries = entries;
+                        app.keepalive_panel.selected = app
+                            .keepalive_panel
+                            .selected
+                            .min(app.keepalive_panel.entries.len().saturating_sub(1));
+                        app.keepalive_panel.open = true;
+                    }
+                    Err(e) => app.set_hint(format!("keepalive list failed: {e}"), HintLevel::Err),
+                },
+                Action::StopKeepalive(pane) => match client.keepalive_stop(&pane).await {
+                    Ok(entries) => {
+                        app.keepalive_panel.entries = entries;
+                        app.keepalive_panel.selected = app
+                            .keepalive_panel
+                            .selected
+                            .min(app.keepalive_panel.entries.len().saturating_sub(1));
+                        app.set_hint(format!("keepalive stopped on {pane}"), HintLevel::Ok);
+                    }
+                    Err(e) => app.set_hint(format!("keepalive stop failed: {e}"), HintLevel::Err),
+                },
                 Action::OpenCollaborationMessage => {
                     refresh_watch_collaboration(client, &mut app).await;
                     open_watch_collaboration_composer(&mut app);
@@ -10381,6 +10462,15 @@ pub(crate) enum Action {
     SelectAskConversation(String),
     /// Point the next question at the other agent.
     CycleAskAgent,
+    /// Submit the `p` popup: start (or replace) a keepalive schedule.
+    SubmitKeepalive {
+        pane: String,
+        interval_secs: u64,
+    },
+    /// `Shift-P` — refresh and open the keepalive schedule list.
+    OpenKeepalivePanel,
+    /// Stop the selected schedule in the keepalive panel.
+    StopKeepalive(String),
     /// `|` moved the list/inspector divider; the run loop persists the new
     /// ratio next to the persisted sort and reports it in one hint.
     InspectorSplitChanged,
@@ -10724,6 +10814,14 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_ask_panel_event(code, app);
     }
 
+    if app.keepalive_popup.is_some() {
+        return handle_keepalive_popup_event(code, modifiers, app);
+    }
+
+    if app.keepalive_panel.open {
+        return handle_keepalive_panel_event(code, app);
+    }
+
     if app.command_palette.is_some() {
         return handle_command_event(code, modifiers, app);
     }
@@ -11000,6 +11098,21 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         }
         KeyCode::Char('W') if app.browse_keys_active() => Action::SetLayout(app.next_work_layout()),
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
+        // Opening needs no daemon round trip — it just needs to know which
+        // pane the schedule would target — so it mutates directly, the
+        // same shape as `n`'s spawn form.
+        KeyCode::Char('p') if app.browse_keys_active() => match app.selected_pane() {
+            Some(pane) => {
+                app.keepalive_popup = Some(KeepalivePopup {
+                    pane,
+                    seconds: String::new(),
+                    cursor: 0,
+                });
+                Action::None
+            }
+            None => Action::NotApplicable("keepalive: no tmux pane on this row"),
+        },
+        KeyCode::Char('P') if app.browse_keys_active() => Action::OpenKeepalivePanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_work_parent();
             Action::None
@@ -11868,6 +11981,94 @@ fn spawn_edit_text(code: KeyCode, modifiers: KeyModifiers, text: &mut String, cu
         KeyCode::Home => *cursor = 0,
         KeyCode::End => *cursor = text.chars().count(),
         _ => {}
+    }
+}
+
+/// The `p` popup: digits only, Enter submits, Esc cancels, and an empty
+/// field closes on Backspace — the same convention every other composer in
+/// this file uses.
+fn handle_keepalive_popup_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    let Some(popup) = app.keepalive_popup.as_mut() else {
+        return Action::None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.keepalive_popup = None;
+            Action::None
+        }
+        KeyCode::Enter => {
+            let parsed = popup.parsed_seconds();
+            let pane = popup.pane.clone();
+            if let Some(interval_secs) = parsed {
+                app.keepalive_popup = None;
+                Action::SubmitKeepalive {
+                    pane,
+                    interval_secs,
+                }
+            } else {
+                app.set_hint(
+                    "keepalive: enter a whole number of seconds greater than 0",
+                    HintLevel::Warn,
+                );
+                Action::None
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && !modifiers.contains(KeyModifiers::CONTROL) => {
+            let idx = char_to_byte_idx(&popup.seconds, popup.cursor);
+            popup.seconds.insert(idx, c);
+            popup.cursor += 1;
+            Action::None
+        }
+        KeyCode::Backspace if popup.cursor > 0 => {
+            let start = char_to_byte_idx(&popup.seconds, popup.cursor - 1);
+            let end = char_to_byte_idx(&popup.seconds, popup.cursor);
+            popup.seconds.replace_range(start..end, "");
+            popup.cursor -= 1;
+            Action::None
+        }
+        KeyCode::Backspace => {
+            if popup.seconds.is_empty() {
+                app.keepalive_popup = None;
+            }
+            Action::None
+        }
+        KeyCode::Left => {
+            popup.cursor = popup.cursor.saturating_sub(1);
+            Action::None
+        }
+        KeyCode::Right => {
+            popup.cursor = (popup.cursor + 1).min(popup.seconds.chars().count());
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+/// `Shift-P`'s schedule list: `d` stops the selected schedule, `j`/`k` and
+/// the arrows move the cursor, Esc/`q`/`P` close it — the same shape as the
+/// ask panel.
+fn handle_keepalive_panel_event(code: KeyCode, app: &mut App) -> Action {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q' | 'P') => {
+            app.keepalive_panel.open = false;
+            Action::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let last = app.keepalive_panel.entries.len().saturating_sub(1);
+            app.keepalive_panel.selected = (app.keepalive_panel.selected + 1).min(last);
+            Action::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.keepalive_panel.selected = app.keepalive_panel.selected.saturating_sub(1);
+            Action::None
+        }
+        KeyCode::Char('d') => {
+            match app.keepalive_panel.entries.get(app.keepalive_panel.selected) {
+                Some(entry) => Action::StopKeepalive(entry.pane.clone()),
+                None => Action::NotApplicable("keepalive: no schedule selected"),
+            }
+        }
+        _ => Action::None,
     }
 }
 
@@ -12962,6 +13163,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         render_spawn(f, popup_area, app);
     }
+    render_keepalive_overlay(f, chunks[1], app);
     if app.command_palette.is_some() {
         let popup_area = command_popup_rect(chunks[1]);
         f.render_widget(Clear, popup_area);
@@ -13215,6 +13417,113 @@ fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
         width: r.width,
         height,
     }
+}
+
+/// Small and dead-center, unlike every other composer in this file — a
+/// keepalive schedule has one field to fill in, not a message to draft.
+fn keepalive_popup_rect(r: Rect) -> Rect {
+    centered_rect_by_size(46, 5, r)
+}
+
+/// `p`'s popup and `Shift-P`'s panel share one call site, the same way the
+/// ask history and its reader do — only one is ever open at a time.
+fn render_keepalive_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if app.keepalive_popup.is_some() {
+        let popup_area = keepalive_popup_rect(area);
+        f.render_widget(Clear, popup_area);
+        render_keepalive_popup(f, popup_area, app);
+    }
+    if app.keepalive_panel.open {
+        let popup_area = centered_rect(70, 60, area);
+        f.render_widget(Clear, popup_area);
+        render_keepalive_panel(f, popup_area, app);
+    }
+}
+
+fn render_keepalive_popup(f: &mut Frame, area: Rect, app: &App) {
+    let Some(popup) = app.keepalive_popup.as_ref() else {
+        return;
+    };
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let label = app.pane_label(&popup.pane);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.action))
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " keepalive · Enter start · Esc cancel ",
+            theme.action_badge(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let seconds = if popup.seconds.is_empty() {
+        "_"
+    } else {
+        popup.seconds.as_str()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("every "),
+            Span::styled(
+                seconds,
+                Style::default().fg(theme.action).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("s, Enter to "),
+            Span::styled(label, theme.dim_style()),
+        ]),
+        Line::from(Span::styled("digits only", theme.dim_style())),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_keepalive_panel(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(
+            " keepalive schedules · d stop · Esc close ",
+            theme.dim_style(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let entries = &app.keepalive_panel.entries;
+    if entries.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no keepalive schedules running — press p on a row to start one",
+                theme.dim_style(),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let now = OffsetDateTime::now_utc();
+    let lines: Vec<Line> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let marker = if i == app.keepalive_panel.selected {
+                Span::styled("> ", theme.action_badge())
+            } else {
+                Span::raw("  ")
+            };
+            let status = if entry.paused {
+                Span::styled("paused", theme.dim_style())
+            } else {
+                Span::styled("running", Style::default().fg(theme.action))
+            };
+            Line::from(vec![
+                marker,
+                Span::raw(app.pane_label(&entry.pane)),
+                Span::raw(format!(" · every {}s · ", entry.interval_secs)),
+                status,
+                Span::raw(format!(" · up {}", collab_screen::age(now, entry.started_at))),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Draw the `w` composer over `area`, or nothing when it is closed. Folded
@@ -20114,6 +20423,84 @@ mod tests {
             matches!(quick_prompt_action(&app), Action::AttachTopologyPane(ref key) if key.pane_id == "%32"),
             "Enter follows Tab's pointer, not activity"
         );
+    }
+
+    #[test]
+    fn p_opens_the_keepalive_popup_for_the_pointed_pane() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+        assert!(matches!(key_action(&mut app, 'p'), Action::None));
+        let popup = app.keepalive_popup.as_ref().expect("p must open the popup");
+        assert_eq!(popup.pane, "%21");
+        assert_eq!(popup.seconds, "");
+    }
+
+    #[test]
+    fn keepalive_popup_accepts_only_digits_and_submits_the_parsed_interval() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+        let _ = key_action(&mut app, 'p');
+
+        // Non-digit keys are ignored — this field only ever means seconds.
+        let _ = handle_keepalive_popup_event(KeyCode::Char('x'), KeyModifiers::NONE, &mut app);
+        assert_eq!(app.keepalive_popup.as_ref().unwrap().seconds, "");
+
+        let _ = handle_keepalive_popup_event(KeyCode::Char('5'), KeyModifiers::NONE, &mut app);
+        assert_eq!(app.keepalive_popup.as_ref().unwrap().seconds, "5");
+
+        let action = handle_keepalive_popup_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(
+            app.keepalive_popup.is_none(),
+            "a successful submit closes the popup"
+        );
+        assert!(matches!(
+            action,
+            Action::SubmitKeepalive { ref pane, interval_secs: 5 } if pane == "%21"
+        ));
+    }
+
+    #[test]
+    fn keepalive_popup_enter_on_empty_input_warns_and_stays_open() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+        let _ = key_action(&mut app, 'p');
+        let action = handle_keepalive_popup_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(app.keepalive_popup.is_some(), "empty input must not submit");
+    }
+
+    #[test]
+    fn backspace_on_an_empty_keepalive_popup_cancels_it() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+        let _ = key_action(&mut app, 'p');
+        let action = handle_keepalive_popup_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(app.keepalive_popup.is_none());
+    }
+
+    #[test]
+    fn shift_p_opens_the_keepalive_panel_and_d_stops_the_selected_schedule() {
+        let mut app = two_pane_window_app();
+        assert!(matches!(key_action(&mut app, 'P'), Action::OpenKeepalivePanel));
+
+        // The run loop would have fetched these from the daemon; the
+        // handler under test only reads what is already in state.
+        app.keepalive_panel.open = true;
+        app.keepalive_panel.entries = vec![muxa::keepalive::KeepaliveInfo {
+            pane: "%21".into(),
+            interval_secs: 5,
+            paused: false,
+            started_at: OffsetDateTime::now_utc(),
+        }];
+        app.keepalive_panel.selected = 0;
+
+        let action = handle_keepalive_panel_event(KeyCode::Char('d'), &mut app);
+        assert!(matches!(action, Action::StopKeepalive(ref pane) if pane == "%21"));
+
+        let action = handle_keepalive_panel_event(KeyCode::Esc, &mut app);
+        assert!(matches!(action, Action::None));
+        assert!(!app.keepalive_panel.open);
     }
 
     /// The border answers "is there something here for me", not "what state
@@ -29065,6 +29452,9 @@ sort = ["state"]
             | Action::OpenAskPanel
             | Action::SelectAskConversation(_)
             | Action::CycleAskAgent
+            | Action::SubmitKeepalive { .. }
+            | Action::OpenKeepalivePanel
+            | Action::StopKeepalive(_)
             | Action::ClaimCollaborationInbox
             | Action::AskConfirm(_)
             | Action::ConfirmYes
@@ -30539,9 +30929,9 @@ sort = ["state"]
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
         ));
-        assert!(
-            body.contains("C / n / w / R  shell window / agent pane / work up / rename the row")
-        );
+        assert!(body.contains(
+            "C/n/w/R/p/P    shell window / agent pane / work up / rename / keepalive start·list"
+        ));
         // The exit keys deliberately live in the overlay's border rather
         // than the matrix — the body is clipped by terminal height, and
         // "how to leave" must not be the row that falls off.
