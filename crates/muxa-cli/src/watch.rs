@@ -2217,7 +2217,11 @@ impl AskReader {
 /// say, so it gets a small centered dialog rather than a chat-shaped panel.
 #[derive(Debug, Clone)]
 struct KeepalivePopup {
-    pane: String,
+    /// Sorted, deduplicated by construction: every pane the schedule will
+    /// start on. The operator's marks (`Space`) when any exist, else just
+    /// the pane the cursor row points at — the same "marks override the
+    /// single row" rule `m` already follows.
+    panes: Vec<String>,
     seconds: String,
     cursor: usize,
 }
@@ -8679,15 +8683,36 @@ pub async fn run(
                     }
                 }
                 Action::SubmitKeepalive {
-                    pane,
+                    panes,
                     interval_secs,
-                } => match client.keepalive_start(&pane, interval_secs).await {
-                    Ok(_) => app.set_hint(
-                        format!("keepalive: every {interval_secs}s on {pane}"),
-                        HintLevel::Ok,
-                    ),
-                    Err(e) => app.set_hint(format!("keepalive failed: {e}"), HintLevel::Err),
-                },
+                } => {
+                    let total = panes.len();
+                    let mut started = 0usize;
+                    let mut failures: Vec<String> = Vec::new();
+                    for pane in panes {
+                        match client.keepalive_start(&pane, interval_secs).await {
+                            Ok(_) => started += 1,
+                            Err(e) => failures.push(format!("{pane}: {e}")),
+                        }
+                    }
+                    if failures.is_empty() {
+                        app.set_hint(
+                            format!(
+                                "keepalive: every {interval_secs}s on {total} pane{}",
+                                if total == 1 { "" } else { "s" }
+                            ),
+                            HintLevel::Ok,
+                        );
+                    } else {
+                        app.set_hint(
+                            format!(
+                                "keepalive: {started}/{total} started — {}",
+                                failures.join("; ")
+                            ),
+                            HintLevel::Err,
+                        );
+                    }
+                }
                 Action::OpenKeepalivePanel => match client.keepalive_list().await {
                     Ok(entries) => {
                         app.keepalive_panel.entries = entries;
@@ -10462,9 +10487,10 @@ pub(crate) enum Action {
     SelectAskConversation(String),
     /// Point the next question at the other agent.
     CycleAskAgent,
-    /// Submit the `p` popup: start (or replace) a keepalive schedule.
+    /// Submit the `p` popup: start (or replace) a keepalive schedule on
+    /// every marked pane, or the cursor's pane when nothing is marked.
     SubmitKeepalive {
-        pane: String,
+        panes: Vec<String>,
         interval_secs: u64,
     },
     /// `Shift-P` — refresh and open the keepalive schedule list.
@@ -11099,19 +11125,30 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('W') if app.browse_keys_active() => Action::SetLayout(app.next_work_layout()),
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         // Opening needs no daemon round trip — it just needs to know which
-        // pane the schedule would target — so it mutates directly, the
-        // same shape as `n`'s spawn form.
-        KeyCode::Char('p') if app.browse_keys_active() => match app.selected_pane() {
-            Some(pane) => {
+        // panes the schedule would target — so it mutates directly, the
+        // same shape as `n`'s spawn form. Marks (`Space`) override the
+        // cursor row exactly the way `m` already resolves its recipients,
+        // so ticking several agents and pressing `p` once starts one
+        // schedule per marked pane.
+        KeyCode::Char('p') if app.browse_keys_active() => {
+            let marked = app.marked_panes();
+            let mut panes: Vec<String> = if marked.is_empty() {
+                app.selected_pane().into_iter().collect()
+            } else {
+                marked.into_iter().collect()
+            };
+            panes.sort_unstable();
+            if panes.is_empty() {
+                Action::NotApplicable("keepalive: no tmux pane on this row")
+            } else {
                 app.keepalive_popup = Some(KeepalivePopup {
-                    pane,
+                    panes,
                     seconds: String::new(),
                     cursor: 0,
                 });
                 Action::None
             }
-            None => Action::NotApplicable("keepalive: no tmux pane on this row"),
-        },
+        }
         KeyCode::Char('P') if app.browse_keys_active() => Action::OpenKeepalivePanel,
         KeyCode::Char('h') if app.browse_keys_active() => {
             app.move_to_work_parent();
@@ -11998,11 +12035,11 @@ fn handle_keepalive_popup_event(code: KeyCode, modifiers: KeyModifiers, app: &mu
         }
         KeyCode::Enter => {
             let parsed = popup.parsed_seconds();
-            let pane = popup.pane.clone();
+            let panes = popup.panes.clone();
             if let Some(interval_secs) = parsed {
                 app.keepalive_popup = None;
                 Action::SubmitKeepalive {
-                    pane,
+                    panes,
                     interval_secs,
                 }
             } else {
@@ -13419,17 +13456,26 @@ fn spawn_popup_rect(r: Rect, spawn: &SpawnComposer) -> Rect {
     }
 }
 
+/// Beyond this many marked panes, the popup lists the first few and folds
+/// the rest into a count rather than growing without bound.
+const KEEPALIVE_POPUP_MAX_LISTED_PANES: usize = 6;
+
 /// Small and dead-center, unlike every other composer in this file — a
 /// keepalive schedule has one field to fill in, not a message to draft.
-fn keepalive_popup_rect(r: Rect) -> Rect {
-    centered_rect_by_size(46, 5, r)
+/// Grows by one line per target pane (capped) so a multi-mark start shows
+/// exactly what it is about to apply to.
+fn keepalive_popup_rect(r: Rect, popup: &KeepalivePopup) -> Rect {
+    let listed = popup.panes.len().min(KEEPALIVE_POPUP_MAX_LISTED_PANES);
+    let overflow = usize::from(popup.panes.len() > KEEPALIVE_POPUP_MAX_LISTED_PANES);
+    let height = u16::try_from(4 + listed + overflow).unwrap_or(u16::MAX);
+    centered_rect_by_size(52, height.min(r.height).max(5), r)
 }
 
 /// `p`'s popup and `Shift-P`'s panel share one call site, the same way the
 /// ask history and its reader do — only one is ever open at a time.
 fn render_keepalive_overlay(f: &mut Frame, area: Rect, app: &App) {
-    if app.keepalive_popup.is_some() {
-        let popup_area = keepalive_popup_rect(area);
+    if let Some(popup) = app.keepalive_popup.as_ref() {
+        let popup_area = keepalive_popup_rect(area, popup);
         f.render_widget(Clear, popup_area);
         render_keepalive_popup(f, popup_area, app);
     }
@@ -13461,7 +13507,6 @@ fn render_keepalive_popup(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
-    let label = keepalive_pane_label(app, &popup.pane);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.action))
@@ -13477,18 +13522,31 @@ fn render_keepalive_popup(f: &mut Frame, area: Rect, app: &App) {
     } else {
         popup.seconds.as_str()
     };
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("every "),
-            Span::styled(
-                seconds,
-                Style::default().fg(theme.action).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("s, Enter to "),
-            Span::styled(label, theme.dim_style()),
-        ]),
-        Line::from(Span::styled("digits only", theme.dim_style())),
-    ];
+    let count = popup.panes.len();
+    let mut lines = vec![Line::from(vec![
+        Span::raw("every "),
+        Span::styled(
+            seconds,
+            Style::default().fg(theme.action).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "s, Enter -> {count} pane{}",
+            if count == 1 { "" } else { "s" }
+        )),
+    ])];
+    for pane in popup.panes.iter().take(KEEPALIVE_POPUP_MAX_LISTED_PANES) {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", keepalive_pane_label(app, pane)),
+            theme.dim_style(),
+        )));
+    }
+    if count > KEEPALIVE_POPUP_MAX_LISTED_PANES {
+        lines.push(Line::from(Span::styled(
+            format!("  ... +{} more", count - KEEPALIVE_POPUP_MAX_LISTED_PANES),
+            theme.dim_style(),
+        )));
+    }
+    lines.push(Line::from(Span::styled("digits only", theme.dim_style())));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -20455,7 +20513,7 @@ mod tests {
         select_window_row(&mut app);
         assert!(matches!(key_action(&mut app, 'p'), Action::None));
         let popup = app.keepalive_popup.as_ref().expect("p must open the popup");
-        assert_eq!(popup.pane, "%21");
+        assert_eq!(popup.panes, vec!["%21".to_string()]);
         assert_eq!(popup.seconds, "");
     }
 
@@ -20479,7 +20537,7 @@ mod tests {
         );
         assert!(matches!(
             action,
-            Action::SubmitKeepalive { ref pane, interval_secs: 5 } if pane == "%21"
+            Action::SubmitKeepalive { ref panes, interval_secs: 5 } if panes == &["%21".to_string()]
         ));
     }
 
@@ -20501,6 +20559,31 @@ mod tests {
         let action = handle_keepalive_popup_event(KeyCode::Backspace, KeyModifiers::NONE, &mut app);
         assert!(matches!(action, Action::None));
         assert!(app.keepalive_popup.is_none());
+    }
+
+    /// Marks override the cursor row for `p` the same way they already do
+    /// for `m` — mark a window's two agents and one `p` starts a schedule
+    /// on both, not just whichever pane the cursor happens to sit on.
+    #[test]
+    fn p_targets_every_marked_pane_when_any_are_marked() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+        assert!(matches!(
+            toggle_collaboration_mark(&mut app),
+            ActionOutcome::Ok(_)
+        ));
+
+        assert!(matches!(key_action(&mut app, 'p'), Action::None));
+        let popup = app.keepalive_popup.as_ref().expect("p must open the popup");
+        assert_eq!(popup.panes, vec!["%21".to_string(), "%32".to_string()]);
+
+        let _ = handle_keepalive_popup_event(KeyCode::Char('5'), KeyModifiers::NONE, &mut app);
+        let action = handle_keepalive_popup_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
+        assert!(matches!(
+            action,
+            Action::SubmitKeepalive { ref panes, interval_secs: 5 }
+                if panes == &["%21".to_string(), "%32".to_string()]
+        ));
     }
 
     #[test]
