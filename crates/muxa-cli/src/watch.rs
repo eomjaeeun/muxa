@@ -1962,7 +1962,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m/M/Space/Alt-M  message/mailbox/mark/clear marks · Tab picks the pane",
+        "  m / M / Space  message / mailbox / mark · Tab picks the window’s pane",
         "  u / U · Alt-A  unread on row / all read · attention-only filter",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
@@ -8744,10 +8744,6 @@ pub async fn run(
                     let outcome = toggle_collaboration_mark(&mut app);
                     apply_outcome_to_app(&mut app, outcome);
                 }
-                Action::ClearCollaborationMarks => {
-                    let outcome = clear_collaboration_marks(&mut app);
-                    apply_outcome_to_app(&mut app, outcome);
-                }
                 Action::DismissBroadcastReport => {
                     app.broadcast_report = None;
                 }
@@ -9796,23 +9792,6 @@ fn collaboration_target_at_cursor(
 /// already fully marked unmarks; anything else marks the lot, because an
 /// operator pressing `Space` on a half-marked window wants the window in the
 /// message, not the half of it that is out.
-/// `Alt-M`: drop every mark at once. Not `Shift-Space` — many terminals
-/// drop the SHIFT bit on space, delivering the same bare `Char(' ')` as
-/// plain Space, so that chord can never be told apart from it. The plain
-/// toggle only ever answers for the cursor's row, so undoing a mark spree
-/// row by row is the thing this exists to skip.
-fn clear_collaboration_marks(app: &mut App) -> ActionOutcome {
-    let count = app.collaboration_marks.len();
-    if count == 0 {
-        return ActionOutcome::Err("nothing marked".into());
-    }
-    app.collaboration_marks.clear();
-    ActionOutcome::Ok(format!(
-        "cleared {count} mark{}",
-        if count == 1 { "" } else { "s" }
-    ))
-}
-
 fn toggle_collaboration_mark(app: &mut App) -> ActionOutcome {
     let row = app.markable_agents();
     if row.len() > 1 {
@@ -10480,9 +10459,6 @@ pub(crate) enum Action {
     /// the durable request composer.
     OpenCollaborationMessage,
     ToggleCollaborationMark,
-    /// `Alt-M`: drop every mark at once, wherever it is — not just the
-    /// cursor's row.
-    ClearCollaborationMarks,
     DismissBroadcastReport,
     /// Refresh and open incoming/sent collaboration history.
     OpenCollaborationMailbox,
@@ -10951,10 +10927,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 app.toggle_event_inbox();
                 Action::None
             }
-            // `m` for mark. Not Shift-Space: many terminals drop the SHIFT
-            // bit on space and deliver the same bare `Char(' ')`, so that
-            // chord can never be told apart from plain Space.
-            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'m') => Action::ClearCollaborationMarks,
             // Digits, not letters: plain typing is the filter here, so the
             // screen axis has to live on a modifier, and every letter worth
             // having is already spoken for.
@@ -20750,47 +20722,6 @@ mod tests {
         assert_eq!(panes, ["%21", "%32"]);
     }
 
-    #[test]
-    fn clear_collaboration_marks_drops_everything_at_once() {
-        let mut app = two_pane_window_app();
-        app.collaboration_marks.insert(CollaborationMark {
-            pane: "%21".into(),
-            agent_session_id: None,
-        });
-        app.collaboration_marks.insert(CollaborationMark {
-            pane: "%32".into(),
-            agent_session_id: None,
-        });
-
-        let outcome = clear_collaboration_marks(&mut app);
-        assert!(matches!(outcome, ActionOutcome::Ok(ref msg) if msg.contains('2')));
-        assert!(app.collaboration_marks.is_empty());
-
-        // Nothing left to clear the second time.
-        assert!(matches!(
-            clear_collaboration_marks(&mut app),
-            ActionOutcome::Err(_)
-        ));
-    }
-
-    /// `Alt-M` clears, and plain `Space` still just toggles the cursor's
-    /// row — moving clear-marks off `Shift-Space` (many terminals never
-    /// report SHIFT held on space) must not disturb the ordinary mark key.
-    #[test]
-    fn alt_m_clears_marks_and_plain_space_still_toggles() {
-        let mut app = two_pane_window_app();
-        select_window_row(&mut app);
-
-        let action = alt_key_action(&mut app, 'm');
-        assert!(matches!(action, Action::ClearCollaborationMarks));
-
-        let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
-            &mut app,
-        );
-        assert!(matches!(action, Action::ToggleCollaborationMark));
-    }
-
     /// Jumping into a window puts every pane of it on screen, so coming back
     /// must not find the window still flagged. Clearing only the pane that was
     /// selected left a two-pane window unread forever.
@@ -29689,10 +29620,6 @@ sort = ["state"]
                 let outcome = toggle_collaboration_mark(app);
                 apply_outcome_to_app(app, outcome);
             }
-            Action::ClearCollaborationMarks => {
-                let outcome = clear_collaboration_marks(app);
-                apply_outcome_to_app(app, outcome);
-            }
             Action::DismissBroadcastReport => app.broadcast_report = None,
         }
     }
@@ -31148,9 +31075,9 @@ sort = ["state"]
         assert!(body.contains("u / U · Alt-A  unread on row / all read · attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
-        assert!(body.contains(
-            "m/M/Space/Alt-M  message/mailbox/mark/clear marks · Tab picks the pane"
-        ));
+        assert!(
+            body.contains("m / M / Space  message / mailbox / mark · Tab picks the window’s pane")
+        );
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
             "a/A · Ctrl-E/n ask / conversations · new mode/draft · Enter read · d/D delete"
