@@ -5252,10 +5252,18 @@ impl App {
         target_pane(self, self.selected_target()?)
     }
 
+    /// The pane Enter/Alt-P/`m`'s degraded form would act on. A window row
+    /// used to answer with `WindowNode::active_pane()` — whichever pane had
+    /// the most recent agent activity — so `Tab` moved the roster's pointer
+    /// (`window_choice`, which the composer already followed) while jumping
+    /// into the window could land on a different pane entirely: the operator
+    /// chose one agent and arrived at another. Routing through the same
+    /// `window_choice` makes the pointer one thing everywhere it is read,
+    /// matching the composer.
     fn selected_action_pane(&self) -> Option<&PaneNode> {
         match self.selected_node()? {
-            TopologyNodeRef::Session(session) => session.active_window()?.active_pane(),
-            TopologyNodeRef::Window(window) => window.active_pane(),
+            TopologyNodeRef::Session(session) => self.window_choice(session.active_window()?),
+            TopologyNodeRef::Window(window) => self.window_choice(window),
             TopologyNodeRef::Pane(pane) => Some(pane),
         }
     }
@@ -20084,6 +20092,28 @@ mod tests {
             .pane_id
             .clone();
         assert_eq!(wrapped, "%21");
+    }
+
+    /// Enter used to jump through `WindowNode::active_pane()` — whichever
+    /// pane had the most recent agent activity — instead of the row's `Tab`
+    /// pointer, so choosing an agent and pressing Enter could land the
+    /// operator on the *other* one. `quick_prompt_action` must follow
+    /// `window_choice`, the same pointer `m` already follows.
+    #[test]
+    fn enter_jumps_to_the_pane_tab_chose() {
+        let mut app = two_pane_window_app();
+        select_window_row(&mut app);
+
+        assert!(
+            matches!(quick_prompt_action(&app), Action::AttachTopologyPane(ref key) if key.pane_id == "%21"),
+            "before any Tab, Enter goes to the window's first agent"
+        );
+
+        assert!(matches!(app.cycle_window_choice(), ActionOutcome::Ok(_)));
+        assert!(
+            matches!(quick_prompt_action(&app), Action::AttachTopologyPane(ref key) if key.pane_id == "%32"),
+            "Enter follows Tab's pointer, not activity"
+        );
     }
 
     /// The border answers "is there something here for me", not "what state
