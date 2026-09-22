@@ -13440,12 +13440,28 @@ fn render_keepalive_overlay(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// `pane_label`'s `session:window_index.pane_index` (e.g.
+/// `project-protogo:5.0`) is precise but tells the operator nothing they
+/// recognize — a keepalive target is picked by eye, not by index. This
+/// trades the index for the window's own name, keeping the exact pane id
+/// alongside it rather than dropping it.
+fn keepalive_pane_label(app: &App, pane_id: &str) -> String {
+    app.panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .filter(|pane| !pane.window_name.is_empty())
+        .map_or_else(
+            || pane_id.to_string(),
+            |pane| format!("{} ({pane_id})", pane.window_name),
+        )
+}
+
 fn render_keepalive_popup(f: &mut Frame, area: Rect, app: &App) {
     let Some(popup) = app.keepalive_popup.as_ref() else {
         return;
     };
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
-    let label = app.pane_label(&popup.pane);
+    let label = keepalive_pane_label(app, &popup.pane);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.action))
@@ -13516,7 +13532,7 @@ fn render_keepalive_panel(f: &mut Frame, area: Rect, app: &App) {
             };
             Line::from(vec![
                 marker,
-                Span::raw(app.pane_label(&entry.pane)),
+                Span::raw(keepalive_pane_label(app, &entry.pane)),
                 Span::raw(format!(" · every {}s · ", entry.interval_secs)),
                 status,
                 Span::raw(format!(" · up {}", collab_screen::age(now, entry.started_at))),
@@ -16861,9 +16877,17 @@ fn render_window_mosaic_cell(
         Span::raw(" "),
         Span::styled(glyph.to_string(), state_style),
         Span::styled(
-            format!(" {}", captured.geometry.pane_id),
-            // The operator's pick. `Tab` moves it and moves tmux's focus with
-            // it, so this is both where `m` sends and where a jump lands.
+            // Plain brackets, not just colour: a badge alone reads as
+            // "this pane is special" without saying *how* — bracketing the
+            // id borrows the universal "this one is selected" convention,
+            // and (being plain ASCII) it survives even where this
+            // environment's font mangles fancier glyphs. `p`/`Enter`/`m`
+            // all resolve to whichever pane wears the brackets.
+            if is_chosen {
+                format!(" [{}]", captured.geometry.pane_id)
+            } else {
+                format!(" {} ", captured.geometry.pane_id)
+            },
             if is_chosen {
                 theme.accent_badge()
             } else {
@@ -22439,6 +22463,52 @@ mod tests {
                 .map(|row| row.as_str())
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+
+    /// A badge alone ("this pane is special, somehow") isn't a self-evident
+    /// signal — brackets read the same way regardless of color perception
+    /// or a font that mangles fancier glyphs, and match the ordinary "this
+    /// one is selected" convention. This is the pane `p`/Enter/`m` resolve
+    /// to.
+    #[test]
+    fn the_chosen_pane_wears_brackets_in_the_mosaic_title() {
+        let (agents, panes) = basic_topology_fixture();
+        let mut app = topology_watch(WatchView::Window, agents, panes);
+        app.watch_cfg.spinner = false;
+        app.inspector_split = InspectorSplit::InspectorWide;
+        let window_key = app.topology.sessions[0].windows[0].key.clone();
+        select_tree_key(&mut app, &TopologyNodeKey::Window(window_key.clone()));
+        app.window_capture = Some(CapturedWindow {
+            key: window_key,
+            zoomed: false,
+            fetched_at: std::time::Instant::now(),
+            panes: vec![CapturedWindowPane {
+                geometry: PaneGeometry {
+                    pane_id: "%1".into(),
+                    pane_index: "0".into(),
+                    left: 0,
+                    top: 0,
+                    width: 100,
+                    height: 20,
+                    active: true,
+                    command: "codex".into(),
+                    alias: None,
+                },
+                text: Some(Text::from("hi")),
+            }],
+        });
+
+        let backend = TestBackend::new(170, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rows.contains("[%1]"),
+            "the pane Tab/Enter/p would target must wear brackets:\n{rows}"
         );
     }
 
