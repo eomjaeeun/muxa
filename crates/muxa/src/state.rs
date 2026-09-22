@@ -702,9 +702,20 @@ fn event_touches_activity(agent: &Agent, ev: &AgentEvent) -> bool {
             AgentState::Working | AgentState::WaitingInput | AgentState::WaitingChoice
         ),
         AgentEvent::ToolStarted { .. } => agent.state != AgentState::Error,
+        // `Info`/`Warning` cover Claude's generic Notification hook — most
+        // visibly its own idle reminder ("Claude is waiting for your
+        // input"), refired periodically while a session simply sits idle.
+        // It changes no state (see the match below) and carries no new
+        // text, so it must not touch activity either: doing so kept
+        // resurrecting a row's unread mark with nothing new to read. The
+        // other levels (NeedsInput/NeedsChoice/Error) do flip the state
+        // and stay activity.
+        AgentEvent::NotificationFired { level, .. } => !matches!(
+            level,
+            NotificationLevel::Info | NotificationLevel::Warning
+        ),
         AgentEvent::Started { .. }
         | AgentEvent::PromptSubmitted { .. }
-        | AgentEvent::NotificationFired { .. }
         | AgentEvent::TurnStopped { .. }
         | AgentEvent::SessionEnded { .. }
         | AgentEvent::RateLimited { .. } => true,
@@ -3236,6 +3247,55 @@ mod tests {
             agent.last_activity_at, t0,
             "stray ToolCompleted must not refresh ACT for an idle row"
         );
+    }
+
+    #[tokio::test]
+    async fn info_level_notification_leaves_activity_and_state_alone() {
+        // Claude's generic Notification hook (anything that isn't a
+        // permission/elicitation prompt) lands here as `Info`, and it
+        // refires periodically — most visibly its own idle reminder —
+        // while the row just sits idle with nothing new to show. It must
+        // not touch `last_activity_at`: doing so kept resurrecting the
+        // watch unread mark with no new content behind it.
+        let store = Store::shared();
+        let t0 = datetime!(2026-05-05 12:00:00 UTC);
+        let t1 = datetime!(2026-05-05 12:05:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("n"),
+                at: t0,
+            })
+            .await;
+        assert_eq!(store.by_session("n").await.unwrap().state, AgentState::Idle);
+
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("n"),
+                level: NotificationLevel::Info,
+                message: "Claude is waiting for your input".into(),
+                at: t1,
+            })
+            .await;
+        let agent = store.by_session("n").await.unwrap();
+        assert_eq!(agent.state, AgentState::Idle);
+        assert_eq!(
+            agent.last_activity_at, t0,
+            "an Info notification must not refresh ACT / resurrect unread"
+        );
+
+        // A NeedsInput notification, in contrast, is genuinely new
+        // information and must still touch activity.
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id("n"),
+                level: NotificationLevel::NeedsInput,
+                message: "permission required".into(),
+                at: t1,
+            })
+            .await;
+        let agent = store.by_session("n").await.unwrap();
+        assert_eq!(agent.state, AgentState::WaitingInput);
+        assert_eq!(agent.last_activity_at, t1);
     }
 
     #[tokio::test]
