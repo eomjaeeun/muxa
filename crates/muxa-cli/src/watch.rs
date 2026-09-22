@@ -2793,6 +2793,97 @@ impl ReadMarks {
     }
 }
 
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct WindowChoiceFile {
+    version: u32,
+    #[serde(default)]
+    choices: Vec<(WindowKey, String)>,
+}
+
+const WINDOW_CHOICE_VERSION: u32 = 1;
+
+/// Durable backing for `App::window_pane_choice` — see that field's doc
+/// comment for why an in-memory map is not enough. Deliberately its own
+/// file rather than folded into `ReadMarks`: same "small, per-operator,
+/// survives a restart" shape, but an unrelated concern.
+///
+/// Stored as a list of pairs, not a map: `WindowKey` is a nested struct, and
+/// `serde_json` can only use plain strings as object keys.
+#[derive(Debug, Default)]
+struct WindowChoices {
+    path: Option<PathBuf>,
+    choices: HashMap<WindowKey, String>,
+    dirty: bool,
+}
+
+impl WindowChoices {
+    fn load(path: Option<PathBuf>) -> Self {
+        let choices = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<WindowChoiceFile>(&text).ok())
+            .filter(|file| file.version == WINDOW_CHOICE_VERSION)
+            .map(|file| file.choices.into_iter().collect())
+            .unwrap_or_default();
+        Self {
+            path,
+            choices,
+            dirty: false,
+        }
+    }
+
+    fn get(&self, key: &WindowKey) -> Option<&str> {
+        self.choices.get(key).map(String::as_str)
+    }
+
+    /// Only `Tab` calls this — see `App::window_pane_choice`'s doc comment.
+    fn set(&mut self, key: WindowKey, pane: String) {
+        if self.choices.get(&key) == Some(&pane) {
+            return;
+        }
+        self.choices.insert(key, pane);
+        self.dirty = true;
+    }
+
+    /// Write the choices back, at most once per changed frame. Failures are
+    /// swallowed the same way `ReadMarks::flush` swallows them: losing a
+    /// pointer is not worth interrupting the TUI, and the next `Tab` retries
+    /// anyway.
+    fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let file = WindowChoiceFile {
+            version: WINDOW_CHOICE_VERSION,
+            choices: self
+                .choices
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        let Ok(text) = serde_json::to_string(&file) else {
+            return;
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        if std::fs::write(path, text).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -3378,11 +3469,13 @@ pub(crate) struct App {
     /// or jumping into a pane all leave it alone: the operator said where the
     /// row points, and it keeps pointing there until they say otherwise.
     ///
-    /// In memory, and keyed by window: it is a pointer into a live topology,
-    /// not something worth restoring days later aimed at a pane that has
-    /// since become someone else. A window with no entry points at its first
-    /// agent pane.
-    window_pane_choice: HashMap<WindowKey, String>,
+    /// Durable, not in-memory-only: `Enter`/`p`/`m` all quit `watch` outright
+    /// to jump into a pane (see `AttachPane`/`AttachTopologyPane`), so an
+    /// in-memory map reset *every* window's choice back to its default the
+    /// moment the operator checked on any single pane — not just the one
+    /// they jumped to. A window with no entry points at its first agent
+    /// pane.
+    window_pane_choice: WindowChoices,
     /// Explicitly expanded session/window keys. Pane keys are leaves and never
     /// enter this set. Keys survive refresh and sort because they include the
     /// complete host+socket ancestry.
@@ -3787,7 +3880,10 @@ impl App {
             read_marks: ReadMarks::load(None),
             #[cfg(not(test))]
             read_marks: ReadMarks::load(muxa::paths::default_watch_read_file()),
-            window_pane_choice: HashMap::new(),
+            #[cfg(test)]
+            window_pane_choice: WindowChoices::load(None),
+            #[cfg(not(test))]
+            window_pane_choice: WindowChoices::load(muxa::paths::default_watch_tab_choice_file()),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
             filtered_selection_anchor: None,
@@ -5370,7 +5466,7 @@ impl App {
         let panes = window_agent_panes(window);
         self.window_pane_choice
             .get(&window.key)
-            .and_then(|chosen| panes.iter().find(|pane| &pane.key.pane_id == chosen))
+            .and_then(|chosen| panes.iter().find(|pane| pane.key.pane_id.as_str() == chosen))
             .or_else(|| panes.first())
             .copied()
     }
@@ -5407,7 +5503,8 @@ impl App {
         // the operator is not looking at only moves that window's remembered
         // cursor — no view moves, no process notices.
         let focused = focus_chosen_pane(&key, &chosen);
-        self.window_pane_choice.insert(key, chosen.clone());
+        self.window_pane_choice.set(key, chosen.clone());
+        self.window_pane_choice.flush();
         match focused {
             Ok(()) => ActionOutcome::Ok(format!("{chosen} · {label}")),
             // The choice still stands; only tmux refused. Say so rather than
@@ -20483,6 +20580,30 @@ mod tests {
             .pane_id
             .clone();
         assert_eq!(wrapped, "%21");
+    }
+
+    /// `Enter`/`p`/`m` all quit `watch` to jump into a pane, so this has to
+    /// outlive the process — an in-memory-only choice reset itself the
+    /// moment the operator checked on *any* pane, not just the one they
+    /// jumped to.
+    #[test]
+    fn window_choice_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch-tab-choice.json");
+
+        let app = two_pane_window_app();
+        let key = app.topology.sessions[0].windows[0].key.clone();
+
+        let mut choices = WindowChoices::load(Some(path.clone()));
+        assert!(choices.get(&key).is_none());
+        choices.set(key.clone(), "%32".into());
+        choices.flush();
+        assert!(path.exists());
+
+        // A fresh load — the same thing `watch` does on every launch,
+        // including the one right after a jump — must still see it.
+        let reloaded = WindowChoices::load(Some(path));
+        assert_eq!(reloaded.get(&key), Some("%32"));
     }
 
     /// Enter used to jump through `WindowNode::active_pane()` — whichever

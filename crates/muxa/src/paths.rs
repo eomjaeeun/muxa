@@ -16,6 +16,7 @@ pub const NODE_ID_FILENAME: &str = "host-id";
 pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
 pub const WATCH_READ_FILENAME: &str = "watch-read.json";
+pub const WATCH_TAB_CHOICE_FILENAME: &str = "watch-tab-choice.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -63,6 +64,17 @@ pub fn default_state_file() -> Option<PathBuf> {
 /// watching the same host have different unread sets.
 pub fn default_watch_read_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_READ_FILENAME))
+}
+
+/// Where `muxa watch` remembers which pane each window row's `Tab` points
+/// at: `$XDG_DATA_HOME/muxa/watch-tab-choice.json`.
+///
+/// Has to survive a restart, not just a refresh: jumping into any pane
+/// (`Enter`/`p`/`m`) quits `watch` outright, so an in-memory-only map would
+/// reset every window's choice back to its default the moment the operator
+/// checked on any one of them — not just the one they jumped to.
+pub fn default_watch_tab_choice_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_TAB_CHOICE_FILENAME))
 }
 
 /// Stable physical-node identity used by Muxa Fleet. It intentionally lives
