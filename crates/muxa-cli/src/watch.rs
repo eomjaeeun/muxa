@@ -1962,7 +1962,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
-        "  m/M/Space/Shift-Space  message/mailbox/mark/clear · Tab picks the pane",
+        "  m/M/Space/Alt-M  message/mailbox/mark/clear marks · Tab picks the pane",
         "  u / U · Alt-A  unread on row / all read · attention-only filter",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
@@ -9796,9 +9796,11 @@ fn collaboration_target_at_cursor(
 /// already fully marked unmarks; anything else marks the lot, because an
 /// operator pressing `Space` on a half-marked window wants the window in the
 /// message, not the half of it that is out.
-/// `Shift-Space`: drop every mark at once. The plain toggle only ever
-/// answers for the cursor's row, so undoing a mark spree row by row is the
-/// thing this exists to skip.
+/// `Alt-M`: drop every mark at once. Not `Shift-Space` — many terminals
+/// drop the SHIFT bit on space, delivering the same bare `Char(' ')` as
+/// plain Space, so that chord can never be told apart from it. The plain
+/// toggle only ever answers for the cursor's row, so undoing a mark spree
+/// row by row is the thing this exists to skip.
 fn clear_collaboration_marks(app: &mut App) -> ActionOutcome {
     let count = app.collaboration_marks.len();
     if count == 0 {
@@ -10478,8 +10480,8 @@ pub(crate) enum Action {
     /// the durable request composer.
     OpenCollaborationMessage,
     ToggleCollaborationMark,
-    /// `Shift-Space`: drop every mark at once, wherever it is — not just
-    /// the cursor's row.
+    /// `Alt-M`: drop every mark at once, wherever it is — not just the
+    /// cursor's row.
     ClearCollaborationMarks,
     DismissBroadcastReport,
     /// Refresh and open incoming/sent collaboration history.
@@ -10949,6 +10951,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 app.toggle_event_inbox();
                 Action::None
             }
+            // `m` for mark. Not Shift-Space: many terminals drop the SHIFT
+            // bit on space and deliver the same bare `Char(' ')`, so that
+            // chord can never be told apart from plain Space.
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'m') => Action::ClearCollaborationMarks,
             // Digits, not letters: plain typing is the filter here, so the
             // screen axis has to live on a modifier, and every letter worth
             // having is already spoken for.
@@ -11073,14 +11079,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('r') if app.browse_keys_active() => Action::Refresh,
         KeyCode::Char('o') if app.browse_keys_active() => Action::OpenPreview,
         KeyCode::Char('m') if app.browse_keys_active() => Action::OpenCollaborationMessage,
-        // Shift-Space must be checked before the bare Space arm below: a
-        // terminal that reports the SHIFT bit on space sends the same
-        // `Char(' ')`, and match arms are tried in order.
-        KeyCode::Char(' ')
-            if modifiers.contains(KeyModifiers::SHIFT) && app.browse_keys_active() =>
-        {
-            Action::ClearCollaborationMarks
-        }
         // Space marks the agent under the cursor for a `m` that addresses
         // several at once. Unbound before this, and the conventional mark key.
         KeyCode::Char(' ') if app.browse_keys_active() => Action::ToggleCollaborationMark,
@@ -20775,18 +20773,15 @@ mod tests {
         ));
     }
 
-    /// `Shift-Space` and plain `Space` both land on the same `Char(' ')`,
-    /// distinguished only by the modifier — the SHIFT arm has to be checked
-    /// first, or it can never fire.
+    /// `Alt-M` clears, and plain `Space` still just toggles the cursor's
+    /// row — moving clear-marks off `Shift-Space` (many terminals never
+    /// report SHIFT held on space) must not disturb the ordinary mark key.
     #[test]
-    fn shift_space_clears_marks_and_plain_space_still_toggles() {
+    fn alt_m_clears_marks_and_plain_space_still_toggles() {
         let mut app = two_pane_window_app();
         select_window_row(&mut app);
 
-        let action = handle_event(
-            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT)),
-            &mut app,
-        );
+        let action = alt_key_action(&mut app, 'm');
         assert!(matches!(action, Action::ClearCollaborationMarks));
 
         let action = handle_event(
@@ -31154,7 +31149,7 @@ sort = ["state"]
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(body.contains(
-            "m/M/Space/Shift-Space  message/mailbox/mark/clear · Tab picks the pane"
+            "m/M/Space/Alt-M  message/mailbox/mark/clear marks · Tab picks the pane"
         ));
         assert!(body.contains("i / e          (in mailbox) claim inbox / reply"));
         assert!(body.contains(
