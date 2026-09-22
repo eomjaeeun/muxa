@@ -19,7 +19,7 @@ use muxa::config::WatchView;
 use ratatui::layout::Constraint;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Row};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::watch::WatchThemeSpec;
 
@@ -476,10 +476,25 @@ fn status_label(status: RequestStatus) -> String {
 }
 
 fn clock(at: OffsetDateTime) -> String {
-    at.format(time::macros::format_description!(
-        "[hour]:[minute]:[second]"
-    ))
-    .unwrap_or_else(|_| "--:--:--".into())
+    clock_at_offset(at, local_offset())
+}
+
+/// `at` is always stored as UTC (`OffsetDateTime::now_utc()`); this screen's
+/// clock column is the only place in the app that had skipped converting it
+/// to the operator's zone before printing hour:minute:second, so it showed
+/// bare UTC on any host not already on UTC. Split out from `clock` so the
+/// conversion can be tested with a fixed offset instead of the host's real
+/// one.
+fn clock_at_offset(at: OffsetDateTime, offset: UtcOffset) -> String {
+    at.to_offset(offset)
+        .format(time::macros::format_description!(
+            "[hour]:[minute]:[second]"
+        ))
+        .unwrap_or_else(|_| "--:--:--".into())
+}
+
+fn local_offset() -> UtcOffset {
+    UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
 }
 
 fn elapsed(start: OffsetDateTime, end: OffsetDateTime) -> String {
@@ -835,6 +850,16 @@ mod tests {
         assert_eq!(age(now, now - time::Duration::days(3)), "3d");
         // A clock that jumped backwards must not render a negative age.
         assert_eq!(age(now, now + time::Duration::minutes(5)), "0s");
+    }
+
+    /// `created_at`/`reply.at` are stored as UTC. The clock column must
+    /// print them in the operator's zone, not raw UTC.
+    #[test]
+    fn the_clock_column_shows_the_operators_zone_not_utc() {
+        let midnight_utc = OffsetDateTime::UNIX_EPOCH; // 1970-01-01T00:00:00Z
+        let kst = UtcOffset::from_hms(9, 0, 0).unwrap();
+        assert_eq!(clock_at_offset(midnight_utc, kst), "09:00:00");
+        assert_eq!(clock_at_offset(midnight_utc, UtcOffset::UTC), "00:00:00");
     }
 
     #[test]
