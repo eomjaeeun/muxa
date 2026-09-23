@@ -11,11 +11,5 @@
 /apps/muxa-macos/.qa-derived/
 /apps/muxa-macos/*.xcresult/
 /apps/muxa-macos/Muxa.xcodeproj/
-# Claude Code's sub-agent isolation worktrees + local agent state — except
-# skills meant to be shared with the repo, e.g. .claude/skills/muxa-bridge.
-# (A bare `.claude/` prunes traversal entirely, so the negation below would
-# never be consulted; `.claude/*` still ignores every top-level entry but
-# lets git walk in far enough to see the re-include.)
-.claude/*
-!.claude/skills/
-!.claude/skills/**
+# Claude Code's sub-agent isolation worktrees + local agent state.
+.claude/
