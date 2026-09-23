@@ -1958,7 +1958,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "Commands & inspection",
         "  :              command palette (Tab completes)",
         "  o / Alt-P      open preview overlay",
-        "  Alt-I / Alt-E  inspector / persistent event inbox",
+        "  Alt-I / Alt-E / Alt-N  inspector / persistent event inbox / memo panel",
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
@@ -2241,6 +2241,11 @@ struct KeepalivePanelState {
     open: bool,
     selected: usize,
     entries: Vec<muxa::keepalive::KeepaliveInfo>,
+}
+
+#[derive(Debug, Default)]
+struct MemoPanelState {
+    open: bool,
 }
 
 /// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
@@ -2884,6 +2889,154 @@ impl WindowChoices {
     }
 }
 
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct MemoFile {
+    version: u32,
+    #[serde(default)]
+    text: String,
+}
+
+const MEMO_VERSION: u32 = 1;
+
+#[derive(Debug, Default)]
+struct Memo {
+    path: Option<PathBuf>,
+    text: String,
+    cursor: usize,
+    dirty: bool,
+}
+
+impl Memo {
+    fn load(path: Option<PathBuf>) -> Self {
+        let text = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<MemoFile>(&text).ok())
+            .filter(|file| file.version == MEMO_VERSION)
+            .map(|file| file.text)
+            .unwrap_or_default();
+        let cursor = text.chars().count();
+        Self {
+            path,
+            text,
+            cursor,
+            dirty: false,
+        }
+    }
+
+    fn insert(&mut self, c: char) {
+        let byte_idx = char_to_byte_idx(&self.text, self.cursor);
+        self.text.insert(byte_idx, c);
+        self.cursor += 1;
+        self.dirty = true;
+    }
+
+    fn newline(&mut self) {
+        self.insert('\n');
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = char_to_byte_idx(&self.text, self.cursor - 1);
+        let end = char_to_byte_idx(&self.text, self.cursor);
+        self.text.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.dirty = true;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.text.chars().count() {
+            return;
+        }
+        let start = char_to_byte_idx(&self.text, self.cursor);
+        let end = char_to_byte_idx(&self.text, self.cursor + 1);
+        self.text.replace_range(start..end, "");
+        self.dirty = true;
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+    }
+
+    fn line_col(&self) -> (usize, usize) {
+        let before: String = self.text.chars().take(self.cursor).collect();
+        let line = before.chars().filter(|c| *c == '\n').count();
+        let col = before.rsplit('\n').next().map_or(0, |s| s.chars().count());
+        (line, col)
+    }
+
+    fn cursor_for_line_col(&self, target_line: usize, col: usize) -> usize {
+        let mut cursor = 0;
+        for (line, text) in self.text.split('\n').enumerate() {
+            if line == target_line {
+                return cursor + col.min(text.chars().count());
+            }
+            cursor += text.chars().count() + 1;
+        }
+        self.text.chars().count()
+    }
+
+    fn move_home(&mut self) {
+        let (line, _) = self.line_col();
+        self.cursor = self.cursor_for_line_col(line, 0);
+    }
+
+    fn move_end(&mut self) {
+        let (line, _) = self.line_col();
+        self.cursor = self.cursor_for_line_col(line, usize::MAX);
+    }
+
+    fn move_up(&mut self) {
+        let (line, col) = self.line_col();
+        if line > 0 {
+            self.cursor = self.cursor_for_line_col(line - 1, col);
+        }
+    }
+
+    fn move_down(&mut self) {
+        let (line, col) = self.line_col();
+        if line + 1 < self.text.split('\n').count() {
+            self.cursor = self.cursor_for_line_col(line + 1, col);
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let file = MemoFile {
+            version: MEMO_VERSION,
+            text: self.text.clone(),
+        };
+        let Ok(text) = serde_json::to_string(&file) else {
+            return;
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        if std::fs::write(path, text).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     origin: Option<CollaborationOrigin>,
@@ -3476,6 +3629,8 @@ pub(crate) struct App {
     /// they jumped to. A window with no entry points at its first agent
     /// pane.
     window_pane_choice: WindowChoices,
+    memo: Memo,
+    memo_panel: MemoPanelState,
     /// Explicitly expanded session/window keys. Pane keys are leaves and never
     /// enter this set. Keys survive refresh and sort because they include the
     /// complete host+socket ancestry.
@@ -3884,6 +4039,10 @@ impl App {
             window_pane_choice: WindowChoices::load(None),
             #[cfg(not(test))]
             window_pane_choice: WindowChoices::load(muxa::paths::default_watch_tab_choice_file()),
+            #[cfg(test)]
+            memo: Memo::load(None),
+            #[cfg(not(test))]
+            memo: Memo::load(muxa::paths::default_watch_memo_file()),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
             filtered_selection_anchor: None,
@@ -3932,6 +4091,7 @@ impl App {
             ask_entries: Vec::new(),
             keepalive_popup: None,
             keepalive_panel: KeepalivePanelState::default(),
+            memo_panel: MemoPanelState::default(),
             ask_conversations: Vec::new(),
             active_ask_conversation_id: None,
             ask_conversations_available: false,
@@ -10824,7 +10984,12 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
-        if let Some(editor) = app.message_skill_editor.as_mut() {
+        if app.memo_panel.open {
+            for c in pasted.chars() {
+                app.memo.insert(c);
+            }
+            app.memo.flush();
+        } else if let Some(editor) = app.message_skill_editor.as_mut() {
             let pasted = pasted.replace(['\r', '\n'], " ");
             let (text, cursor) = editor.field_mut();
             insert_str_at(text, cursor, &pasted);
@@ -10945,6 +11110,10 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_keepalive_panel_event(code, app);
     }
 
+    if app.memo_panel.open {
+        return handle_memo_event(code, modifiers, app);
+    }
+
     if app.command_palette.is_some() {
         return handle_command_event(code, modifiers, app);
     }
@@ -11022,6 +11191,13 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => {
                 app.toggle_event_inbox();
+                Action::None
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'n') => {
+                app.memo_panel.open = !app.memo_panel.open;
+                if !app.memo_panel.open {
+                    app.memo.flush();
+                }
                 Action::None
             }
             // Digits, not letters: plain typing is the filter here, so the
@@ -12206,6 +12382,59 @@ fn handle_keepalive_panel_event(code: KeyCode, app: &mut App) -> Action {
     }
 }
 
+fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
+    let mut mutated = false;
+    match code {
+        KeyCode::Esc => {
+            app.memo_panel.open = false;
+            app.memo.flush();
+        }
+        KeyCode::Char(c)
+            if modifiers.contains(KeyModifiers::ALT) && c.eq_ignore_ascii_case(&'n') =>
+        {
+            app.memo_panel.open = false;
+            app.memo.flush();
+        }
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(pasted) = system_clipboard_text() {
+                for c in pasted.chars() {
+                    app.memo.insert(c);
+                }
+                mutated = true;
+            }
+        }
+        KeyCode::Enter => {
+            app.memo.newline();
+            mutated = true;
+        }
+        KeyCode::Backspace => {
+            app.memo.backspace();
+            mutated = true;
+        }
+        KeyCode::Delete => {
+            app.memo.delete();
+            mutated = true;
+        }
+        KeyCode::Left => app.memo.move_left(),
+        KeyCode::Right => app.memo.move_right(),
+        KeyCode::Up => app.memo.move_up(),
+        KeyCode::Down => app.memo.move_down(),
+        KeyCode::Home => app.memo.move_home(),
+        KeyCode::End => app.memo.move_end(),
+        // ALT is excluded alongside CONTROL: an unhandled `Alt-<char>` is a
+        // chord, not text. Without this `Alt-N` could type into the memo.
+        KeyCode::Char(c) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.memo.insert(c);
+            mutated = true;
+        }
+        _ => {}
+    }
+    if mutated {
+        app.memo.flush();
+    }
+    Action::None
+}
+
 /// Resolve Tab inside the composer: cycle the per-target option, or say why
 /// there is nothing to cycle. Returns whether persisted send defaults changed.
 fn composer_cycle_option(app: &mut App) -> bool {
@@ -13197,6 +13426,35 @@ pub(crate) fn quick_copy_action(app: &App) -> Action {
 
 // ---- rendering ------------------------------------------------------------
 
+fn render_main_content(
+    f: &mut Frame,
+    body_area: Rect,
+    app: &mut App,
+    tree_targets: Option<&[TreeTarget]>,
+) -> Rect {
+    let memo_chunks = app.memo_panel.open.then(|| {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+            .split(body_area)
+    });
+    let topology_area = memo_chunks.as_ref().map_or(body_area, |areas| areas[0]);
+    match app.preview.as_ref().map(|p| p.mode) {
+        Some(PreviewMode::Fullscreen) => render_preview(f, topology_area, app),
+        Some(PreviewMode::Popup) => {
+            render_body(f, topology_area, app, tree_targets);
+            let popup_area = centered_rect(80, 70, topology_area);
+            f.render_widget(Clear, popup_area);
+            render_preview(f, popup_area, app);
+        }
+        None => render_body(f, topology_area, app, tree_targets),
+    }
+    if let Some(memo_area) = memo_chunks.as_ref().map(|areas| areas[1]) {
+        render_memo_panel(f, memo_area, app);
+    }
+    topology_area
+}
+
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
     // Advance the animation clock once per paint so the swarm view's dot
     // spinners cycle. Harmless for the table views (which ignore it).
@@ -13227,26 +13485,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(area);
-
     render_header(f, chunks[0], app, tree_targets);
-    match app.preview.as_ref().map(|p| p.mode) {
-        Some(PreviewMode::Fullscreen) => {
-            render_preview(f, chunks[1], app);
-        }
-        Some(PreviewMode::Popup) => {
-            // Render the table behind so the user keeps a sense of
-            // "where am I in the list" — then `Clear` the popup area
-            // (wipes the cells under it so the popup paints clean) and
-            // render the preview on top.
-            render_body(f, chunks[1], app, tree_targets);
-            let popup_area = centered_rect(80, 70, chunks[1]);
-            f.render_widget(Clear, popup_area);
-            render_preview(f, popup_area, app);
-        }
-        None => {
-            render_body(f, chunks[1], app, tree_targets);
-        }
-    }
+    let topology_area = render_main_content(f, chunks[1], app, tree_targets);
     // Overlays land on top of either the preview or the table —
     // `Clear` first so the popup body isn't visible-through-the-popup.
     // Help and confirm are mutually exclusive: opening confirm closes
@@ -13256,17 +13496,17 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         // The help body is the complete keybinding matrix. Size it by
         // the actual line count so new bindings don't silently clip the
         // final rows on common terminal heights.
-        let popup_area = help_popup_rect(chunks[1]);
+        let popup_area = help_popup_rect(topology_area);
         f.render_widget(Clear, popup_area);
         render_help(f, popup_area, app);
     }
     if app.event_inbox_open {
-        let popup_area = centered_rect(76, 72, chunks[1]);
+        let popup_area = centered_rect(76, 72, topology_area);
         f.render_widget(Clear, popup_area);
         render_event_inbox(f, popup_area, app);
     }
     if app.collaboration_mailbox.open {
-        let popup_area = centered_rect(88, 78, chunks[1]);
+        let popup_area = centered_rect(88, 78, topology_area);
         f.render_widget(Clear, popup_area);
         render_collaboration_mailbox(f, popup_area, app);
     }
@@ -13275,36 +13515,36 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             .collaboration_composer
             .as_ref()
             .is_some_and(|composer| composer.skill_palette.is_some());
-        let popup_area = message_composer_rect(chunks[1], skills_open);
+        let popup_area = message_composer_rect(topology_area, skills_open);
         f.render_widget(Clear, popup_area);
         render_collaboration_composer(f, popup_area, app);
     }
-    render_ask_overlay(f, chunks[1], app);
-    render_broadcast_report_overlay(f, chunks[1], app);
-    render_work_composer_overlay(f, chunks[1], app);
-    render_rename_overlay(f, chunks[1], app);
+    render_ask_overlay(f, topology_area, app);
+    render_broadcast_report_overlay(f, topology_area, app);
+    render_work_composer_overlay(f, topology_area, app);
+    render_rename_overlay(f, topology_area, app);
     if app.ask_composer.is_some() {
         let skills_open = app
             .ask_composer
             .as_ref()
             .is_some_and(|ask| ask.skill_palette.is_some());
-        let popup_area = message_composer_rect(chunks[1], skills_open);
+        let popup_area = message_composer_rect(topology_area, skills_open);
         f.render_widget(Clear, popup_area);
         render_ask_composer(f, popup_area, app);
     }
     if let Some(spawn) = app.spawn.as_ref() {
-        let popup_area = spawn_popup_rect(chunks[1], spawn);
+        let popup_area = spawn_popup_rect(topology_area, spawn);
         f.render_widget(Clear, popup_area);
         render_spawn(f, popup_area, app);
     }
-    render_keepalive_overlay(f, chunks[1], app);
+    render_keepalive_overlay(f, topology_area, app);
     if app.command_palette.is_some() {
-        let popup_area = command_popup_rect(chunks[1]);
+        let popup_area = command_popup_rect(topology_area);
         f.render_widget(Clear, popup_area);
         render_command_palette(f, popup_area, app);
     }
     if app.message_skill_editor.is_some() {
-        let popup_area = message_skill_editor_rect(chunks[1]);
+        let popup_area = message_skill_editor_rect(topology_area);
         f.render_widget(Clear, popup_area);
         render_message_skill_editor(f, popup_area, app);
     }
@@ -13312,7 +13552,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         // Confirmation is always the top-most overlay, including when it was
         // opened from ask history. 50 × 30 % keeps the popup small enough that
         // the context behind stays scannable while retaining the y/N hint.
-        let popup_area = centered_rect(50, 30, chunks[1]);
+        let popup_area = centered_rect(50, 30, topology_area);
         f.render_widget(Clear, popup_area);
         render_confirm(f, popup_area, app);
     }
@@ -13580,6 +13820,26 @@ fn render_keepalive_overlay(f: &mut Frame, area: Rect, app: &App) {
         let popup_area = centered_rect(70, 60, area);
         f.render_widget(Clear, popup_area);
         render_keepalive_panel(f, popup_area, app);
+    }
+}
+
+fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(Span::styled(" memo · Alt-N close ", theme.dim_style()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines: Vec<Line> = app.memo.text.split('\n').map(Line::from).collect();
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    let (line, col) = app.memo.line_col();
+    let x = inner.x + u16::try_from(col).unwrap_or(u16::MAX);
+    let y = inner.y + u16::try_from(line).unwrap_or(u16::MAX);
+    if x < inner.x + inner.width && y < inner.y + inner.height {
+        f.set_cursor_position((x, y));
     }
 }
 
@@ -20604,6 +20864,64 @@ mod tests {
         // including the one right after a jump — must still see it.
         let reloaded = WindowChoices::load(Some(path));
         assert_eq!(reloaded.get(&key), Some("%32"));
+    }
+
+    #[test]
+    fn memo_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch-memo.json");
+        let mut memo = Memo::load(Some(path.clone()));
+        for c in "first\nsecond".chars() {
+            memo.insert(c);
+        }
+        memo.flush();
+
+        let reloaded = Memo::load(Some(path));
+        assert_eq!(reloaded.text, "first\nsecond");
+        assert_eq!(reloaded.cursor, reloaded.text.chars().count());
+    }
+
+    #[test]
+    fn memo_edits_multiline_text() {
+        let mut memo = Memo::default();
+        memo.insert('a');
+        memo.insert('b');
+        memo.newline();
+        memo.insert('c');
+        memo.backspace();
+        memo.insert('d');
+        assert_eq!(memo.text, "ab\nd");
+        assert_eq!(memo.cursor, 4);
+    }
+
+    #[test]
+    fn memo_moves_vertically_by_line_and_column() {
+        let mut memo = Memo {
+            text: "abcd\nxy\n12345".into(),
+            cursor: 3,
+            ..Memo::default()
+        };
+        memo.move_down();
+        assert_eq!(memo.cursor, 7, "column clamps to the short middle line");
+        memo.move_down();
+        assert_eq!(memo.cursor, 10, "the clamped column carries to line three");
+        memo.move_up();
+        assert_eq!(memo.cursor, 7);
+        memo.move_up();
+        assert_eq!(memo.cursor, 2);
+    }
+
+    #[test]
+    fn memo_home_and_end_stay_on_the_current_line() {
+        let mut memo = Memo {
+            text: "one\ntwo\nthree".into(),
+            cursor: 6,
+            ..Memo::default()
+        };
+        memo.move_home();
+        assert_eq!(memo.cursor, 4);
+        memo.move_end();
+        assert_eq!(memo.cursor, 7);
     }
 
     /// Enter used to jump through `WindowNode::active_pane()` — whichever
@@ -31195,7 +31513,9 @@ sort = ["state"]
         assert!(body.contains(":              command palette"));
         assert!(body.contains("u / U · Alt-A  unread on row / all read · attention-only filter"));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
-        assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
+        assert!(
+            body.contains("Alt-I / Alt-E / Alt-N  inspector / persistent event inbox / memo panel")
+        );
         assert!(
             body.contains("m / M / Space  message / mailbox / mark · Tab picks the window’s pane")
         );
@@ -31461,6 +31781,26 @@ sort = ["state"]
             app.footer_hint.as_ref().map(|h| h.message.as_str()),
             Some("inspector enabled")
         );
+    }
+
+    #[test]
+    fn alt_n_toggles_the_memo_panel() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        assert!(!app.memo_panel.open);
+        assert!(matches!(alt_key_action(&mut app, 'n'), Action::None));
+        assert!(app.memo_panel.open);
+        assert!(matches!(alt_key_action(&mut app, 'n'), Action::None));
+        assert!(!app.memo_panel.open);
+    }
+
+    #[test]
+    fn another_modal_captures_keys_before_the_memo_handler() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.keepalive_panel.open = true;
+        assert!(matches!(key_action(&mut app, 'z'), Action::None));
+        assert!(app.memo.text.is_empty());
+        assert!(!app.memo_panel.open);
+        assert!(app.keepalive_panel.open);
     }
 
     #[test]

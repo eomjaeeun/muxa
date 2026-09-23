@@ -17,6 +17,7 @@ pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
 pub const WATCH_READ_FILENAME: &str = "watch-read.json";
 pub const WATCH_TAB_CHOICE_FILENAME: &str = "watch-tab-choice.json";
+pub const WATCH_MEMO_FILENAME: &str = "watch-memo.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -75,6 +76,16 @@ pub fn default_watch_read_file() -> Option<PathBuf> {
 /// checked on any one of them — not just the one they jumped to.
 pub fn default_watch_tab_choice_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_TAB_CHOICE_FILENAME))
+}
+
+/// Where `muxa watch`'s `Alt-N` scratch memo lives:
+/// `$XDG_DATA_HOME/muxa/watch-memo.json`.
+///
+/// Data, not config, same reasoning as `default_watch_read_file`: it's a
+/// per-operator scratchpad that changes on every keystroke, not something
+/// that belongs in `config.toml`.
+pub fn default_watch_memo_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_MEMO_FILENAME))
 }
 
 /// Stable physical-node identity used by Muxa Fleet. It intentionally lives
