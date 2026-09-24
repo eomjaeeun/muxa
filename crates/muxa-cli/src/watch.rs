@@ -1958,12 +1958,12 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "Commands & inspection",
         "  :              command palette (Tab completes)",
         "  o / Alt-P      open preview overlay",
-        "  Alt-I / Alt-E / Alt-N  inspector / persistent event inbox / memo panel",
+        "  Alt-I / Alt-E  inspector / persistent event inbox",
         "  |              cycle list/inspector split (50/50 → 70/30 → 30/70)",
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M / Space  message / mailbox / mark · Tab picks the window’s pane",
-        "  u / U · Alt-A  unread on row / all read · attention-only filter",
+        "  u/U · Alt-A · Shift-N  unread row / all read · attention filter · memo panel",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -11193,13 +11193,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
                 app.toggle_event_inbox();
                 Action::None
             }
-            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'n') => {
-                app.memo_panel.open = !app.memo_panel.open;
-                if !app.memo_panel.open {
-                    app.memo.flush();
-                }
-                Action::None
-            }
             // Digits, not letters: plain typing is the filter here, so the
             // screen axis has to live on a modifier, and every letter worth
             // having is already spoken for.
@@ -11397,6 +11390,13 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         }
         KeyCode::Char('W') if app.browse_keys_active() => Action::SetLayout(app.next_work_layout()),
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
+        KeyCode::Char('N') if app.browse_keys_active() => {
+            app.memo_panel.open = !app.memo_panel.open;
+            if !app.memo_panel.open {
+                app.memo.flush();
+            }
+            Action::None
+        }
         // Opening needs no daemon round trip — it just needs to know which
         // panes the schedule would target — so it mutates directly, the
         // same shape as `n`'s spawn form. Marks (`Space`) override the
@@ -12385,13 +12385,7 @@ fn handle_keepalive_panel_event(code: KeyCode, app: &mut App) -> Action {
 fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
     let mut mutated = false;
     match code {
-        KeyCode::Esc => {
-            app.memo_panel.open = false;
-            app.memo.flush();
-        }
-        KeyCode::Char(c)
-            if modifiers.contains(KeyModifiers::ALT) && c.eq_ignore_ascii_case(&'n') =>
-        {
+        KeyCode::Esc | KeyCode::Char('N') => {
             app.memo_panel.open = false;
             app.memo.flush();
         }
@@ -12422,7 +12416,7 @@ fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> A
         KeyCode::Home => app.memo.move_home(),
         KeyCode::End => app.memo.move_end(),
         // ALT is excluded alongside CONTROL: an unhandled `Alt-<char>` is a
-        // chord, not text. Without this `Alt-N` could type into the memo.
+        // chord, not text. Without this another Alt binding could type into the memo.
         KeyCode::Char(c) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
             app.memo.insert(c);
             mutated = true;
@@ -13829,7 +13823,7 @@ fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
-        .title(Span::styled(" memo · Alt-N close ", theme.dim_style()));
+        .title(Span::styled(" memo · Shift-N close ", theme.dim_style()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let lines: Vec<Line> = app.memo.text.split('\n').map(Line::from).collect();
@@ -31511,11 +31505,11 @@ sort = ["state"]
             body.contains("↑/↓ · j/k       move siblings in focus mode; visible nodes otherwise")
         );
         assert!(body.contains(":              command palette"));
-        assert!(body.contains("u / U · Alt-A  unread on row / all read · attention-only filter"));
+        assert!(body.contains(
+            "u/U · Alt-A · Shift-N  unread row / all read · attention filter · memo panel"
+        ));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
-        assert!(
-            body.contains("Alt-I / Alt-E / Alt-N  inspector / persistent event inbox / memo panel")
-        );
+        assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
         assert!(
             body.contains("m / M / Space  message / mailbox / mark · Tab picks the window’s pane")
         );
@@ -31784,12 +31778,12 @@ sort = ["state"]
     }
 
     #[test]
-    fn alt_n_toggles_the_memo_panel() {
+    fn shift_n_toggles_the_memo_panel() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         assert!(!app.memo_panel.open);
-        assert!(matches!(alt_key_action(&mut app, 'n'), Action::None));
+        assert!(matches!(key_action(&mut app, 'N'), Action::None));
         assert!(app.memo_panel.open);
-        assert!(matches!(alt_key_action(&mut app, 'n'), Action::None));
+        assert!(matches!(key_action(&mut app, 'N'), Action::None));
         assert!(!app.memo_panel.open);
     }
 
