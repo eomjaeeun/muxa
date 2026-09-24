@@ -2380,6 +2380,22 @@ fn wrap_input_rows(text: &str, avail: usize) -> Vec<(String, usize)> {
     rows
 }
 
+/// Wrap memo text into display rows while preserving explicit newlines.
+/// Row starts are character indices into the complete memo text.
+fn wrap_memo_rows(text: &str, avail: usize) -> Vec<(String, usize)> {
+    let mut rows = Vec::new();
+    let mut paragraph_start = 0usize;
+    for paragraph in text.split('\n') {
+        rows.extend(
+            wrap_input_rows(paragraph, avail)
+                .into_iter()
+                .map(|(row, start)| (row, paragraph_start + start)),
+        );
+        paragraph_start += paragraph.chars().count() + 1;
+    }
+    rows
+}
+
 /// POSIX-safe single quoting: close, escape the quote, reopen.
 fn shell_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -13895,6 +13911,8 @@ fn render_keepalive_overlay(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let focused = app.memo_panel == MemoPanelState::Focused;
     let style = if focused {
@@ -13914,15 +13932,26 @@ fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(title, style));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let lines: Vec<Line> = app.memo.text.split('\n').map(Line::from).collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let rows = wrap_memo_rows(&app.memo.text, inner.width as usize);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(row, _)| Line::from(row.clone()))
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 
     if focused {
-        let (line, col) = app.memo.line_col();
-        let x = inner.x + u16::try_from(col).unwrap_or(u16::MAX);
-        let y = inner.y + u16::try_from(line).unwrap_or(u16::MAX);
-        if x < inner.x + inner.width && y < inner.y + inner.height {
-            f.set_cursor_position((x, y));
+        for (i, (row, start)) in rows.iter().enumerate() {
+            let end = start + row.chars().count();
+            let last = i + 1 == rows.len();
+            if app.memo.cursor >= *start && (app.memo.cursor < end || last) {
+                let before: String = row.chars().take(app.memo.cursor - start).collect();
+                let x = inner.x + u16::try_from(before.width()).unwrap_or(u16::MAX);
+                let y = inner.y + u16::try_from(i).unwrap_or(u16::MAX);
+                if x < inner.x + inner.width && y < inner.y + inner.height {
+                    f.set_cursor_position((x, y));
+                }
+                break;
+            }
         }
     }
 }
@@ -24476,6 +24505,27 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_memo_rows_compose_display_width_and_explicit_newlines() {
+        assert_eq!(
+            wrap_memo_rows("가나다라마바", 6),
+            vec![("가나다".to_string(), 0), ("라마바".to_string(), 3)]
+        );
+        assert_eq!(
+            wrap_memo_rows("가나다라\n마바사아", 6),
+            vec![
+                ("가나다".to_string(), 0),
+                ("라".to_string(), 3),
+                ("마바사".to_string(), 5),
+                ("아".to_string(), 8),
+            ]
+        );
+        assert_eq!(
+            wrap_memo_rows("\n", 6),
+            vec![(String::new(), 0), (String::new(), 1)]
+        );
+    }
+
+    #[test]
     fn spawn_refuses_an_empty_prompt_and_a_bogus_directory() {
         let mut app = app_with_paneless_and_pane();
         let _ = key_action(&mut app, 'n');
@@ -31992,6 +32042,23 @@ sort = ["state"]
             Some("─")
         );
         assert!(app.inspector_visible);
+    }
+
+    #[test]
+    fn memo_cursor_tracks_wide_glyphs_across_soft_and_hard_wraps() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.memo_panel = MemoPanelState::Focused;
+        app.memo.text = format!("{}\n나다", "가".repeat(40));
+        app.memo.cursor = 43;
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(5, 19)
+        );
     }
 
     #[test]
