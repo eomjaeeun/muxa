@@ -27,7 +27,7 @@ j/k move  ·  / filter  ·  : commands  ·  ? help
 │                           │  [/] · f/c      (in preview) agent / geometry / content                          │                           │
 │                           │  Enter          (in preview) jump to pinned pane                                 │                           │
 │                           │  m / M / Space  message / mailbox / mark · Tab picks the window’s pane           │                           │
-│                           │  u/U · Alt-A · Shift-N  unread row / all read · attention filter · memo panel    │                           │
+│                           │  u/U · Alt-A · Ctrl-N   unread row / all read · attention filter · memo panel    │                           │
 │                           │  Alt-1/2 · W    screen topology / collab · W is the work table                   │                           │
 │                           │  v              (in collab) toggle table / sequence history                      │                           │
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │

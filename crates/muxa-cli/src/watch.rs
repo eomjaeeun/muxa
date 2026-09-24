@@ -1963,7 +1963,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M / Space  message / mailbox / mark · Tab picks the window’s pane",
-        "  u/U · Alt-A · Shift-N  unread row / all read · attention filter · memo panel",
+        "  u/U · Alt-A · Ctrl-N   unread row / all read · attention filter · memo panel",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -11414,6 +11414,12 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             app.set_hint(format!("marked {cleared} read"), HintLevel::Ok);
             Action::None
         }
+        KeyCode::Char('n')
+            if modifiers.contains(KeyModifiers::CONTROL) && app.browse_keys_active() =>
+        {
+            app.memo_panel = MemoPanelState::Focused;
+            Action::None
+        }
         KeyCode::Char('n') if app.browse_keys_active() => {
             let fallback_dir =
                 std::env::current_dir().map_or_else(|_| "~".into(), |p| p.display().to_string());
@@ -11452,10 +11458,6 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         }
         KeyCode::Char('W') if app.browse_keys_active() => Action::SetLayout(app.next_work_layout()),
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
-        KeyCode::Char('N') if app.browse_keys_active() => {
-            app.memo_panel = MemoPanelState::Focused;
-            Action::None
-        }
         // Opening needs no daemon round trip — it just needs to know which
         // panes the schedule would target — so it mutates directly, the
         // same shape as `n`'s spawn form. Marks (`Space`) override the
@@ -12448,7 +12450,7 @@ fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> A
             app.memo_panel = MemoPanelState::Open;
             app.memo.flush();
         }
-        KeyCode::Char('N') if modifiers.is_empty() => {
+        KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.memo_panel = MemoPanelState::Closed;
             app.memo.flush();
         }
@@ -13901,9 +13903,9 @@ fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
         theme.dim_style()
     };
     let title = if focused {
-        " memo · Esc browse · N close "
+        " memo · Esc browse · Ctrl-N close "
     } else {
-        " memo · Shift-N edit "
+        " memo · Ctrl-N edit "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -31632,7 +31634,7 @@ sort = ["state"]
         );
         assert!(body.contains(":              command palette"));
         assert!(body.contains(
-            "u/U · Alt-A · Shift-N  unread row / all read · attention filter · memo panel"
+            "u/U · Alt-A · Ctrl-N   unread row / all read · attention filter · memo panel"
         ));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
@@ -31907,7 +31909,23 @@ sort = ["state"]
     fn memo_panel_can_blur_refocus_and_close() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
         assert_eq!(app.memo_panel, MemoPanelState::Closed);
-        assert!(matches!(key_action(&mut app, 'N'), Action::None));
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert_eq!(app.memo_panel, MemoPanelState::Focused);
+
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert_eq!(app.memo.text, "N");
         assert_eq!(app.memo_panel, MemoPanelState::Focused);
 
         assert!(matches!(
@@ -31924,14 +31942,27 @@ sort = ["state"]
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
             (0..24)
-                .any(|y| row_text(terminal.backend().buffer(), y).contains("memo · Shift-N edit")),
+                .any(|y| row_text(terminal.backend().buffer(), y).contains("memo · Ctrl-N edit")),
             "the blurred memo remains visible"
         );
 
-        assert!(matches!(key_action(&mut app, 'N'), Action::None));
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+                &mut app,
+            ),
+            Action::None
+        ));
         assert_eq!(app.memo_panel, MemoPanelState::Focused);
-        assert!(matches!(key_action(&mut app, 'N'), Action::None));
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+                &mut app,
+            ),
+            Action::None
+        ));
         assert_eq!(app.memo_panel, MemoPanelState::Closed);
+        assert_eq!(app.memo.text, "N");
     }
 
     #[test]
@@ -31949,7 +31980,7 @@ sort = ["state"]
         // left border must continue through that row at full body height.
         let memo_border = row_text(buf, 16);
         assert!(
-            memo_border.contains("memo · Shift-N edit"),
+            memo_border.contains("memo · Ctrl-N edit"),
             "{memo_border:?}"
         );
         assert_eq!(
