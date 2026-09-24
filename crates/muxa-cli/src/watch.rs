@@ -13426,27 +13426,17 @@ fn render_main_content(
     app: &mut App,
     tree_targets: Option<&[TreeTarget]>,
 ) -> Rect {
-    let memo_chunks = app.memo_panel.open.then(|| {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
-            .split(body_area)
-    });
-    let topology_area = memo_chunks.as_ref().map_or(body_area, |areas| areas[0]);
     match app.preview.as_ref().map(|p| p.mode) {
-        Some(PreviewMode::Fullscreen) => render_preview(f, topology_area, app),
+        Some(PreviewMode::Fullscreen) => render_preview(f, body_area, app),
         Some(PreviewMode::Popup) => {
-            render_body(f, topology_area, app, tree_targets);
-            let popup_area = centered_rect(80, 70, topology_area);
+            render_body(f, body_area, app, tree_targets);
+            let popup_area = centered_rect(80, 70, body_area);
             f.render_widget(Clear, popup_area);
             render_preview(f, popup_area, app);
         }
-        None => render_body(f, topology_area, app, tree_targets),
+        None => render_body(f, body_area, app, tree_targets),
     }
-    if let Some(memo_area) = memo_chunks.as_ref().map(|areas| areas[1]) {
-        render_memo_panel(f, memo_area, app);
-    }
-    topology_area
+    body_area
 }
 
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
@@ -16364,16 +16354,22 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App, tree_targets: Option<&[
 
 fn render_primary_body(
     f: &mut Frame,
-    area: Rect,
+    mut area: Rect,
     app: &mut App,
     tree_targets: Option<&[TreeTarget]>,
 ) {
+    let memo_area = app.memo_panel.open.then(|| {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+            .split(area);
+        area = chunks[0];
+        chunks[1]
+    });
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
     if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         render_collab_screen(f, area, app);
-        return;
-    }
-    if app.legacy_flat_table {
+    } else if app.legacy_flat_table {
         render_table(f, area, app);
     } else if app.watch_cfg.layout == WatchLayout::Work {
         render_work_table(f, area, app, tree_targets.unwrap_or_default());
@@ -16381,6 +16377,9 @@ fn render_primary_body(
         render_swarm(f, area, app, tree_targets.unwrap_or_default());
     } else {
         render_tree_table(f, area, app, tree_targets.unwrap_or_default());
+    }
+    if let Some(memo_area) = memo_area {
+        render_memo_panel(f, memo_area, app);
     }
 }
 
@@ -31785,6 +31784,32 @@ sort = ["state"]
         assert!(app.memo_panel.open);
         assert!(matches!(key_action(&mut app, 'N'), Action::None));
         assert!(!app.memo_panel.open);
+    }
+
+    #[test]
+    fn memo_panel_only_splits_the_topology_column() {
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.memo_panel.open = true;
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // The body occupies y=3..22. Its 67/33 split puts the memo border at
+        // y=16, but only inside the 70-column topology half. The inspector's
+        // left border must continue through that row at full body height.
+        let memo_border = row_text(buf, 16);
+        assert!(memo_border.contains("memo · Shift-N close"), "{memo_border:?}");
+        assert_eq!(
+            buf.cell((70, 16)).map(ratatui::buffer::Cell::symbol),
+            Some("│")
+        );
+        assert_ne!(
+            buf.cell((80, 16)).map(ratatui::buffer::Cell::symbol),
+            Some("─")
+        );
+        assert!(app.inspector_visible);
     }
 
     #[test]
