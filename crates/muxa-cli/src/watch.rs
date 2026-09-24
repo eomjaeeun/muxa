@@ -2243,9 +2243,14 @@ struct KeepalivePanelState {
     entries: Vec<muxa::keepalive::KeepaliveInfo>,
 }
 
-#[derive(Debug, Default)]
-struct MemoPanelState {
-    open: bool,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum MemoPanelState {
+    #[default]
+    Closed,
+    /// Visible while ordinary browse-mode keys continue to control topology.
+    Open,
+    /// Visible and capturing every keystroke for memo editing.
+    Focused,
 }
 
 /// Which agent CLI the spawn form launches. `Left`/`Right` cycle it.
@@ -2990,6 +2995,63 @@ impl Memo {
     fn move_end(&mut self) {
         let (line, _) = self.line_col();
         self.cursor = self.cursor_for_line_col(line, usize::MAX);
+    }
+
+    fn prev_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut idx = self.cursor.min(chars.len());
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        while idx > 0 && !chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn next_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut idx = self.cursor.min(chars.len());
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        while idx < chars.len() && !chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        idx
+    }
+
+    fn move_word_left(&mut self) {
+        self.cursor = self.prev_word_boundary();
+    }
+
+    fn move_word_right(&mut self) {
+        self.cursor = self.next_word_boundary();
+    }
+
+    fn delete_word_left(&mut self) {
+        let target = self.prev_word_boundary();
+        if target == self.cursor {
+            return;
+        }
+        let start = char_to_byte_idx(&self.text, target);
+        let end = char_to_byte_idx(&self.text, self.cursor);
+        self.text.replace_range(start..end, "");
+        self.cursor = target;
+        self.dirty = true;
+    }
+
+    fn delete_to_home(&mut self) {
+        let (line, _) = self.line_col();
+        let target = self.cursor_for_line_col(line, 0);
+        if target == self.cursor {
+            return;
+        }
+        let start = char_to_byte_idx(&self.text, target);
+        let end = char_to_byte_idx(&self.text, self.cursor);
+        self.text.replace_range(start..end, "");
+        self.cursor = target;
+        self.dirty = true;
     }
 
     fn move_up(&mut self) {
@@ -10984,7 +11046,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
-        if app.memo_panel.open {
+        if app.memo_panel == MemoPanelState::Focused {
             for c in pasted.chars() {
                 app.memo.insert(c);
             }
@@ -11110,7 +11172,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_keepalive_panel_event(code, app);
     }
 
-    if app.memo_panel.open {
+    if app.memo_panel == MemoPanelState::Focused {
         return handle_memo_event(code, modifiers, app);
     }
 
@@ -11391,10 +11453,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('W') if app.browse_keys_active() => Action::SetLayout(app.next_work_layout()),
         KeyCode::Char('A') if app.browse_keys_active() => Action::OpenAskPanel,
         KeyCode::Char('N') if app.browse_keys_active() => {
-            app.memo_panel.open = !app.memo_panel.open;
-            if !app.memo_panel.open {
-                app.memo.flush();
-            }
+            app.memo_panel = MemoPanelState::Focused;
             Action::None
         }
         // Opening needs no daemon round trip — it just needs to know which
@@ -12385,8 +12444,12 @@ fn handle_keepalive_panel_event(code: KeyCode, app: &mut App) -> Action {
 fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> Action {
     let mut mutated = false;
     match code {
-        KeyCode::Esc | KeyCode::Char('N') => {
-            app.memo_panel.open = false;
+        KeyCode::Esc => {
+            app.memo_panel = MemoPanelState::Open;
+            app.memo.flush();
+        }
+        KeyCode::Char('N') if modifiers.is_empty() => {
+            app.memo_panel = MemoPanelState::Closed;
             app.memo.flush();
         }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -12399,6 +12462,28 @@ fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> A
         }
         KeyCode::Enter => {
             app.memo.newline();
+            mutated = true;
+        }
+        KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => app.memo.move_home(),
+        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => app.memo.move_end(),
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.memo.delete_to_home();
+            mutated = true;
+        }
+        KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.memo.delete_word_left();
+            mutated = true;
+        }
+        KeyCode::Char('b') if modifiers.contains(KeyModifiers::ALT) => app.memo.move_word_left(),
+        KeyCode::Char('f') if modifiers.contains(KeyModifiers::ALT) => app.memo.move_word_right(),
+        KeyCode::Left if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            app.memo.move_word_left();
+        }
+        KeyCode::Right if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            app.memo.move_word_right();
+        }
+        KeyCode::Backspace if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            app.memo.delete_word_left();
             mutated = true;
         }
         KeyCode::Backspace => {
@@ -13809,21 +13894,34 @@ fn render_keepalive_overlay(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let focused = app.memo_panel == MemoPanelState::Focused;
+    let style = if focused {
+        theme.border_style()
+    } else {
+        theme.dim_style()
+    };
+    let title = if focused {
+        " memo · Esc browse · N close "
+    } else {
+        " memo · Shift-N edit "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border_style())
+        .border_style(style)
         .border_type(theme.border_type)
-        .title(Span::styled(" memo · Shift-N close ", theme.dim_style()));
+        .title(Span::styled(title, style));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let lines: Vec<Line> = app.memo.text.split('\n').map(Line::from).collect();
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
-    let (line, col) = app.memo.line_col();
-    let x = inner.x + u16::try_from(col).unwrap_or(u16::MAX);
-    let y = inner.y + u16::try_from(line).unwrap_or(u16::MAX);
-    if x < inner.x + inner.width && y < inner.y + inner.height {
-        f.set_cursor_position((x, y));
+    if focused {
+        let (line, col) = app.memo.line_col();
+        let x = inner.x + u16::try_from(col).unwrap_or(u16::MAX);
+        let y = inner.y + u16::try_from(line).unwrap_or(u16::MAX);
+        if x < inner.x + inner.width && y < inner.y + inner.height {
+            f.set_cursor_position((x, y));
+        }
     }
 }
 
@@ -16358,7 +16456,7 @@ fn render_primary_body(
     app: &mut App,
     tree_targets: Option<&[TreeTarget]>,
 ) {
-    let memo_area = app.memo_panel.open.then(|| {
+    let memo_area = (app.memo_panel != MemoPanelState::Closed).then(|| {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
@@ -20915,6 +21013,35 @@ mod tests {
         assert_eq!(memo.cursor, 4);
         memo.move_end();
         assert_eq!(memo.cursor, 7);
+    }
+
+    #[test]
+    fn memo_word_edits_cross_lines_but_delete_to_home_does_not() {
+        let mut memo = Memo {
+            text: "one two\nthree four".into(),
+            cursor: 13,
+            ..Memo::default()
+        };
+        memo.move_word_left();
+        assert_eq!(memo.cursor, 8);
+        memo.move_word_left();
+        assert_eq!(memo.cursor, 4, "word-left crosses the newline");
+        memo.move_word_right();
+        assert_eq!(memo.cursor, 7);
+        memo.move_word_right();
+        assert_eq!(memo.cursor, 13, "word-right crosses the newline");
+        memo.delete_word_left();
+        assert_eq!(memo.text, "one two\n four");
+        assert_eq!(memo.cursor, 8);
+
+        let mut memo = Memo {
+            text: "first line\nsecond line".into(),
+            cursor: 17,
+            ..Memo::default()
+        };
+        memo.delete_to_home();
+        assert_eq!(memo.text, "first line\n line");
+        assert_eq!(memo.cursor, 11);
     }
 
     /// Enter used to jump through `WindowNode::active_pane()` — whichever
@@ -31777,13 +31904,34 @@ sort = ["state"]
     }
 
     #[test]
-    fn shift_n_toggles_the_memo_panel() {
+    fn memo_panel_can_blur_refocus_and_close() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        assert!(!app.memo_panel.open);
+        assert_eq!(app.memo_panel, MemoPanelState::Closed);
         assert!(matches!(key_action(&mut app, 'N'), Action::None));
-        assert!(app.memo_panel.open);
+        assert_eq!(app.memo_panel, MemoPanelState::Focused);
+
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &mut app,
+            ),
+            Action::None
+        ));
+        assert_eq!(app.memo_panel, MemoPanelState::Open);
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            (0..24)
+                .any(|y| row_text(terminal.backend().buffer(), y).contains("memo · Shift-N edit")),
+            "the blurred memo remains visible"
+        );
+
         assert!(matches!(key_action(&mut app, 'N'), Action::None));
-        assert!(!app.memo_panel.open);
+        assert_eq!(app.memo_panel, MemoPanelState::Focused);
+        assert!(matches!(key_action(&mut app, 'N'), Action::None));
+        assert_eq!(app.memo_panel, MemoPanelState::Closed);
     }
 
     #[test]
@@ -31791,7 +31939,7 @@ sort = ["state"]
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        app.memo_panel.open = true;
+        app.memo_panel = MemoPanelState::Open;
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -31800,7 +31948,10 @@ sort = ["state"]
         // y=16, but only inside the 70-column topology half. The inspector's
         // left border must continue through that row at full body height.
         let memo_border = row_text(buf, 16);
-        assert!(memo_border.contains("memo · Shift-N close"), "{memo_border:?}");
+        assert!(
+            memo_border.contains("memo · Shift-N edit"),
+            "{memo_border:?}"
+        );
         assert_eq!(
             buf.cell((70, 16)).map(ratatui::buffer::Cell::symbol),
             Some("│")
@@ -31818,7 +31969,7 @@ sort = ["state"]
         app.keepalive_panel.open = true;
         assert!(matches!(key_action(&mut app, 'z'), Action::None));
         assert!(app.memo.text.is_empty());
-        assert!(!app.memo_panel.open);
+        assert_eq!(app.memo_panel, MemoPanelState::Closed);
         assert!(app.keepalive_panel.open);
     }
 
