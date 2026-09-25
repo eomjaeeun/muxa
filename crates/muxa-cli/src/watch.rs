@@ -14016,17 +14016,45 @@ fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 
     if focused {
+        // The last row whose start is at or before the cursor wins — not the
+        // first row that merely contains it. A `\n` consumes a char index
+        // that belongs to no row's `[start, end)` range (the paragraph after
+        // it starts one past the newline), so a cursor sitting at the end of
+        // a non-final line, or on a blank line that isn't the document's
+        // last, matched no row under a break-on-first-match scan and simply
+        // never got drawn. Scanning to the end and keeping the last
+        // candidate handles that gap correctly, and still prefers a
+        // soft-wrap continuation's row over the row above it when both
+        // qualify at the exact same index.
+        let mut cursor_at: Option<(usize, usize)> = None;
         for (i, (row, start)) in rows.iter().enumerate() {
-            let end = start + row.chars().count();
-            let last = i + 1 == rows.len();
-            if app.memo.cursor >= *start && (app.memo.cursor < end || last) {
-                let before: String = row.chars().take(app.memo.cursor - start).collect();
-                let x = inner.x + u16::try_from(before.width()).unwrap_or(u16::MAX);
-                let y = inner.y + u16::try_from(i).unwrap_or(u16::MAX);
-                if x < inner.x + inner.width && y < inner.y + inner.height {
-                    f.set_cursor_position((x, y));
-                }
-                break;
+            if app.memo.cursor >= *start {
+                let col = (app.memo.cursor - start).min(row.chars().count());
+                cursor_at = Some((i, col));
+            }
+        }
+        if let Some((i, col)) = cursor_at {
+            let row = &rows[i].0;
+            let before: String = row.chars().take(col).collect();
+            let before_width = before.width();
+            // A row packed to exactly the panel's width with the cursor at
+            // its very end has nowhere left on that row to draw — wrap to
+            // column 0 of the row below, the way a terminal wraps once a
+            // display line fills up, rather than silently dropping the
+            // cursor at the border.
+            let (x, y) = if col == row.chars().count()
+                && before_width >= inner.width as usize
+                && i + 1 < inner.height as usize
+            {
+                (inner.x, inner.y + u16::try_from(i + 1).unwrap_or(u16::MAX))
+            } else {
+                (
+                    inner.x + u16::try_from(before_width).unwrap_or(u16::MAX),
+                    inner.y + u16::try_from(i).unwrap_or(u16::MAX),
+                )
+            };
+            if x < inner.x + inner.width && y < inner.y + inner.height {
+                f.set_cursor_position((x, y));
             }
         }
     }
@@ -32160,6 +32188,71 @@ sort = ["state"]
         assert_eq!(
             terminal.get_cursor_position().unwrap(),
             ratatui::layout::Position::new(5, 19)
+        );
+    }
+
+    #[test]
+    fn memo_cursor_shows_at_line_end_before_an_unpressed_newline() {
+        // The `\n` between "first" and "second" consumes a char index that
+        // belongs to neither row. A cursor sitting right there — exactly
+        // where the operator would be an instant before pressing Enter —
+        // used to match no row at all and simply never got drawn.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.memo_panel.state = MemoPanelState::Focused;
+        app.memo.text = "first\nsecond".into();
+        app.memo.cursor = 5;
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(6, 17),
+            "cursor must land right after \"first\", not vanish"
+        );
+    }
+
+    #[test]
+    fn memo_cursor_shows_on_a_blank_line_that_is_not_the_last_line() {
+        // Same gap-index bug as above, from the other side: a blank
+        // paragraph's own row has start == end, and that single valid
+        // cursor value is exactly the index the newline consumed.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.memo_panel.state = MemoPanelState::Focused;
+        app.memo.text = "first\n\nthird".into();
+        app.memo.cursor = 6;
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 18),
+            "cursor must land at column 0 of the blank line, not vanish"
+        );
+    }
+
+    #[test]
+    fn memo_cursor_wraps_to_the_next_row_when_the_last_row_is_exactly_full() {
+        // A row packed to exactly the panel's width has no cell left to draw
+        // the cursor on when the cursor sits at that row's own end — it must
+        // wrap to column 0 of the row below, like a terminal wrapping a full
+        // display line, instead of landing on the border and being skipped.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.memo_panel.state = MemoPanelState::Focused;
+        app.memo.text = "a".repeat(78);
+        app.memo.cursor = 78;
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 18),
+            "cursor must wrap to column 0 of the next row, not vanish on the border"
         );
     }
 
