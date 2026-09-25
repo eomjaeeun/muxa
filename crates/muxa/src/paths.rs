@@ -18,6 +18,7 @@ pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
 pub const WATCH_READ_FILENAME: &str = "watch-read.json";
 pub const WATCH_TAB_CHOICE_FILENAME: &str = "watch-tab-choice.json";
 pub const WATCH_MEMO_FILENAME: &str = "watch-memo.json";
+pub const WATCH_MEMO_PANEL_FILENAME: &str = "watch-memo-panel.json";
 
 /// Default daemon socket path. Prefers `$XDG_RUNTIME_DIR/muxa.sock`; falls
 /// back to `/tmp/muxa-<uid>.sock` when the runtime dir is unset.
@@ -78,7 +79,7 @@ pub fn default_watch_tab_choice_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_TAB_CHOICE_FILENAME))
 }
 
-/// Where `muxa watch`'s `Alt-N` scratch memo lives:
+/// Where `muxa watch`'s `Ctrl-N` scratch memo lives:
 /// `$XDG_DATA_HOME/muxa/watch-memo.json`.
 ///
 /// Data, not config, same reasoning as `default_watch_read_file`: it's a
@@ -86,6 +87,17 @@ pub fn default_watch_tab_choice_file() -> Option<PathBuf> {
 /// that belongs in `config.toml`.
 pub fn default_watch_memo_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_MEMO_FILENAME))
+}
+
+/// Where `muxa watch` remembers whether the scratch memo panel was open
+/// (and focused) when the operator last left it:
+/// `$XDG_DATA_HOME/muxa/watch-memo-panel.json`.
+///
+/// Has to survive a restart for the same reason `default_watch_tab_choice_file`
+/// does: jumping into any pane quits `watch` outright, so an in-memory-only
+/// flag would reset the panel to closed every time the operator came back.
+pub fn default_watch_memo_panel_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(WATCH_MEMO_PANEL_FILENAME))
 }
 
 /// Stable physical-node identity used by Muxa Fleet. It intentionally lives

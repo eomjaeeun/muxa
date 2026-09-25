@@ -2243,7 +2243,7 @@ struct KeepalivePanelState {
     entries: Vec<muxa::keepalive::KeepaliveInfo>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum MemoPanelState {
     #[default]
     Closed,
@@ -2890,6 +2890,76 @@ impl WindowChoices {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+        };
+        let Ok(text) = serde_json::to_string(&file) else {
+            return;
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        if std::fs::write(path, text).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct MemoPanelFile {
+    version: u32,
+    #[serde(default)]
+    state: MemoPanelState,
+}
+
+const MEMO_PANEL_VERSION: u32 = 1;
+
+#[derive(Debug, Default)]
+struct MemoPanelStore {
+    path: Option<PathBuf>,
+    state: MemoPanelState,
+    dirty: bool,
+}
+
+impl MemoPanelStore {
+    fn load(path: Option<PathBuf>) -> Self {
+        let state = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<MemoPanelFile>(&text).ok())
+            .filter(|file| file.version == MEMO_PANEL_VERSION)
+            .map(|file| file.state)
+            .unwrap_or_default();
+        Self {
+            path,
+            state,
+            dirty: false,
+        }
+    }
+
+    fn set(&mut self, state: MemoPanelState) {
+        if state != self.state {
+            self.state = state;
+            self.dirty = true;
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let file = MemoPanelFile {
+            version: MEMO_PANEL_VERSION,
+            state: self.state,
         };
         let Ok(text) = serde_json::to_string(&file) else {
             return;
@@ -3708,7 +3778,7 @@ pub(crate) struct App {
     /// pane.
     window_pane_choice: WindowChoices,
     memo: Memo,
-    memo_panel: MemoPanelState,
+    memo_panel: MemoPanelStore,
     /// Explicitly expanded session/window keys. Pane keys are leaves and never
     /// enter this set. Keys survive refresh and sort because they include the
     /// complete host+socket ancestry.
@@ -4121,6 +4191,10 @@ impl App {
             memo: Memo::load(None),
             #[cfg(not(test))]
             memo: Memo::load(muxa::paths::default_watch_memo_file()),
+            #[cfg(test)]
+            memo_panel: MemoPanelStore::load(None),
+            #[cfg(not(test))]
+            memo_panel: MemoPanelStore::load(muxa::paths::default_watch_memo_panel_file()),
             expanded_nodes: HashSet::new(),
             tree_expansion_initialized: false,
             filtered_selection_anchor: None,
@@ -4169,7 +4243,6 @@ impl App {
             ask_entries: Vec::new(),
             keepalive_popup: None,
             keepalive_panel: KeepalivePanelState::default(),
-            memo_panel: MemoPanelState::default(),
             ask_conversations: Vec::new(),
             active_ask_conversation_id: None,
             ask_conversations_available: false,
@@ -11062,7 +11135,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
     if let Event::Paste(pasted) = ev {
-        if app.memo_panel == MemoPanelState::Focused {
+        if app.memo_panel.state == MemoPanelState::Focused {
             for c in pasted.chars() {
                 app.memo.insert(c);
             }
@@ -11188,7 +11261,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         return handle_keepalive_panel_event(code, app);
     }
 
-    if app.memo_panel == MemoPanelState::Focused {
+    if app.memo_panel.state == MemoPanelState::Focused {
         return handle_memo_event(code, modifiers, app);
     }
 
@@ -11433,7 +11506,8 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
         KeyCode::Char('n')
             if modifiers.contains(KeyModifiers::CONTROL) && app.browse_keys_active() =>
         {
-            app.memo_panel = MemoPanelState::Focused;
+            app.memo_panel.set(MemoPanelState::Focused);
+            app.memo_panel.flush();
             Action::None
         }
         KeyCode::Char('n') if app.browse_keys_active() => {
@@ -12463,11 +12537,13 @@ fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> A
     let mut mutated = false;
     match code {
         KeyCode::Esc => {
-            app.memo_panel = MemoPanelState::Open;
+            app.memo_panel.set(MemoPanelState::Open);
+            app.memo_panel.flush();
             app.memo.flush();
         }
         KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.memo_panel = MemoPanelState::Closed;
+            app.memo_panel.set(MemoPanelState::Closed);
+            app.memo_panel.flush();
             app.memo.flush();
         }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -13914,7 +13990,7 @@ fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
     use unicode_width::UnicodeWidthStr;
 
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
-    let focused = app.memo_panel == MemoPanelState::Focused;
+    let focused = app.memo_panel.state == MemoPanelState::Focused;
     let style = if focused {
         theme.border_style()
     } else {
@@ -16487,7 +16563,7 @@ fn render_primary_body(
     app: &mut App,
     tree_targets: Option<&[TreeTarget]>,
 ) {
-    let memo_area = (app.memo_panel != MemoPanelState::Closed).then(|| {
+    let memo_area = (app.memo_panel.state != MemoPanelState::Closed).then(|| {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
@@ -21001,6 +21077,32 @@ mod tests {
         let reloaded = Memo::load(Some(path));
         assert_eq!(reloaded.text, "first\nsecond");
         assert_eq!(reloaded.cursor, reloaded.text.chars().count());
+    }
+
+    #[test]
+    fn memo_panel_state_persists_and_defaults_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch-memo-panel.json");
+
+        let mut panel = MemoPanelStore::load(Some(path.clone()));
+        assert_eq!(panel.state, MemoPanelState::Closed);
+        panel.set(MemoPanelState::Focused);
+        panel.flush();
+
+        let reloaded = MemoPanelStore::load(Some(path.clone()));
+        assert_eq!(reloaded.state, MemoPanelState::Focused);
+
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(
+            MemoPanelStore::load(Some(path.clone())).state,
+            MemoPanelState::Closed
+        );
+
+        std::fs::write(&path, r#"{"version":2,"state":"Open"}"#).unwrap();
+        assert_eq!(
+            MemoPanelStore::load(Some(path)).state,
+            MemoPanelState::Closed
+        );
     }
 
     #[test]
@@ -31958,7 +32060,7 @@ sort = ["state"]
     #[test]
     fn memo_panel_can_blur_refocus_and_close() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        assert_eq!(app.memo_panel, MemoPanelState::Closed);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Closed);
         assert!(matches!(
             handle_event(
                 Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
@@ -31966,7 +32068,7 @@ sort = ["state"]
             ),
             Action::None
         ));
-        assert_eq!(app.memo_panel, MemoPanelState::Focused);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Focused);
 
         assert!(matches!(
             handle_event(
@@ -31976,7 +32078,7 @@ sort = ["state"]
             Action::None
         ));
         assert_eq!(app.memo.text, "N");
-        assert_eq!(app.memo_panel, MemoPanelState::Focused);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Focused);
 
         assert!(matches!(
             handle_event(
@@ -31985,7 +32087,7 @@ sort = ["state"]
             ),
             Action::None
         ));
-        assert_eq!(app.memo_panel, MemoPanelState::Open);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Open);
 
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -32003,7 +32105,7 @@ sort = ["state"]
             ),
             Action::None
         ));
-        assert_eq!(app.memo_panel, MemoPanelState::Focused);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Focused);
         assert!(matches!(
             handle_event(
                 Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
@@ -32011,7 +32113,7 @@ sort = ["state"]
             ),
             Action::None
         ));
-        assert_eq!(app.memo_panel, MemoPanelState::Closed);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Closed);
         assert_eq!(app.memo.text, "N");
     }
 
@@ -32020,7 +32122,7 @@ sort = ["state"]
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        app.memo_panel = MemoPanelState::Open;
+        app.memo_panel.state = MemoPanelState::Open;
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -32049,7 +32151,7 @@ sort = ["state"]
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        app.memo_panel = MemoPanelState::Focused;
+        app.memo_panel.state = MemoPanelState::Focused;
         app.memo.text = format!("{}\n나다", "가".repeat(40));
         app.memo.cursor = 43;
 
@@ -32067,7 +32169,7 @@ sort = ["state"]
         app.keepalive_panel.open = true;
         assert!(matches!(key_action(&mut app, 'z'), Action::None));
         assert!(app.memo.text.is_empty());
-        assert_eq!(app.memo_panel, MemoPanelState::Closed);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Closed);
         assert!(app.keepalive_panel.open);
     }
 
