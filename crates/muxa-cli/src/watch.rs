@@ -12551,6 +12551,11 @@ fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> A
             app.memo.newline();
             mutated = true;
         }
+        KeyCode::Tab => {
+            app.memo.insert(' ');
+            app.memo.insert(' ');
+            mutated = true;
+        }
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => app.memo.move_home(),
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => app.memo.move_end(),
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -32124,6 +32129,22 @@ sort = ["state"]
         ));
         assert_eq!(app.memo_panel.state, MemoPanelState::Focused);
         assert_eq!(app.memo.text, "N");
+    }
+
+    #[test]
+    fn tab_inserts_two_spaces_into_focused_memo() {
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+        app.memo_panel.state = MemoPanelState::Focused;
+        app.memo.text = "abcd".into();
+        app.memo.cursor = 2;
+
+        assert!(matches!(
+            handle_memo_event(KeyCode::Tab, KeyModifiers::NONE, &mut app),
+            Action::None
+        ));
+
+        assert_eq!(app.memo.text, "ab  cd");
+        assert_eq!(app.memo.cursor, 4);
     }
 
     #[test]
