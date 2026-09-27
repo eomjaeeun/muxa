@@ -1963,7 +1963,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M / Space  message / mailbox / mark · Tab picks the window’s pane",
-        "  u/U · Alt-A · Ctrl-N   unread row / all read · attention filter · memo panel",
+        "  u/U · Alt-A · N        unread row / all read · attention filter · memo panel",
         "  Alt-1/2 · W    screen topology / collab · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
@@ -2246,8 +2246,8 @@ struct KeepalivePanelState {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum MemoPanelState {
     #[default]
-    Closed,
-    /// Visible while ordinary browse-mode keys continue to control topology.
+    /// Visible while ordinary browse-mode keys continue to control topology;
+    /// `N` focuses the panel for editing.
     Open,
     /// Visible and capturing every keystroke for memo editing.
     Focused,
@@ -11503,9 +11503,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             app.set_hint(format!("marked {cleared} read"), HintLevel::Ok);
             Action::None
         }
-        KeyCode::Char('n')
-            if modifiers.contains(KeyModifiers::CONTROL) && app.browse_keys_active() =>
-        {
+        KeyCode::Char('N') if app.browse_keys_active() => {
             app.memo_panel.set(MemoPanelState::Focused);
             app.memo_panel.flush();
             Action::None
@@ -12538,11 +12536,6 @@ fn handle_memo_event(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> A
     match code {
         KeyCode::Esc => {
             app.memo_panel.set(MemoPanelState::Open);
-            app.memo_panel.flush();
-            app.memo.flush();
-        }
-        KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.memo_panel.set(MemoPanelState::Closed);
             app.memo_panel.flush();
             app.memo.flush();
         }
@@ -13996,11 +13989,7 @@ fn render_memo_panel(f: &mut Frame, area: Rect, app: &App) {
     } else {
         theme.dim_style()
     };
-    let title = if focused {
-        " memo · Esc browse · Ctrl-N close "
-    } else {
-        " memo · Ctrl-N edit "
-    };
+    let title = " Note ";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
@@ -16591,14 +16580,12 @@ fn render_primary_body(
     app: &mut App,
     tree_targets: Option<&[TreeTarget]>,
 ) {
-    let memo_area = (app.memo_panel.state != MemoPanelState::Closed).then(|| {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
-            .split(area);
-        area = chunks[0];
-        chunks[1]
-    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+        .split(area);
+    area = chunks[0];
+    let memo_area = chunks[1];
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
     if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         render_collab_screen(f, area, app);
@@ -16611,9 +16598,7 @@ fn render_primary_body(
     } else {
         render_tree_table(f, area, app, tree_targets.unwrap_or_default());
     }
-    if let Some(memo_area) = memo_area {
-        render_memo_panel(f, memo_area, app);
-    }
+    render_memo_panel(f, memo_area, app);
 }
 
 fn render_inspector(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[TreeTarget]>) {
@@ -20158,6 +20143,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, tree_targets: Option<&[Tr
         Span::raw(" message  "),
         Span::styled(" M ", theme.action_badge()),
         Span::raw(" mailbox  "),
+        Span::styled(" N ", theme.action_badge()),
+        Span::raw(" note  "),
         Span::styled(" ? ", theme.key_badge()),
         Span::raw(" help"),
     ]);
@@ -21113,7 +21100,7 @@ mod tests {
         let path = dir.path().join("watch-memo-panel.json");
 
         let mut panel = MemoPanelStore::load(Some(path.clone()));
-        assert_eq!(panel.state, MemoPanelState::Closed);
+        assert_eq!(panel.state, MemoPanelState::Open);
         panel.set(MemoPanelState::Focused);
         panel.flush();
 
@@ -21123,14 +21110,17 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(
             MemoPanelStore::load(Some(path.clone())).state,
-            MemoPanelState::Closed
+            MemoPanelState::Open
         );
 
         std::fs::write(&path, r#"{"version":2,"state":"Open"}"#).unwrap();
         assert_eq!(
-            MemoPanelStore::load(Some(path)).state,
-            MemoPanelState::Closed
+            MemoPanelStore::load(Some(path.clone())).state,
+            MemoPanelState::Open
         );
+
+        std::fs::write(&path, r#"{"version":1,"state":"Closed"}"#).unwrap();
+        assert_eq!(MemoPanelStore::load(Some(path)).state, MemoPanelState::Open);
     }
 
     #[test]
@@ -27314,7 +27304,7 @@ mod tests {
     #[test]
     fn host_badges_render_only_in_multi_host() {
         fn render_to_string(app: &mut App) -> String {
-            let backend = TestBackend::new(120, 12);
+            let backend = TestBackend::new(120, 18);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|f| render(f, app)).unwrap();
             terminal
@@ -31271,7 +31261,7 @@ sort = ["state"]
     fn collab_sequence_paints_lifelines_and_chronological_arrow() {
         let mut app = collab_app("%2");
         app.collab.set_layout(CollabLayout::Sequence);
-        let backend = ratatui::backend::TestBackend::new(180, 20);
+        let backend = ratatui::backend::TestBackend::new(180, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let painted: String = terminal
@@ -31361,7 +31351,7 @@ sort = ["state"]
         // The row can only hold an excerpt, and the body is the reason the
         // operator opened the screen.
         let mut app = collab_app("%2");
-        let backend = ratatui::backend::TestBackend::new(160, 20);
+        let backend = ratatui::backend::TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let painted: String = terminal
@@ -31814,7 +31804,7 @@ sort = ["state"]
         );
         assert!(body.contains(":              command palette"));
         assert!(body.contains(
-            "u/U · Alt-A · Ctrl-N   unread row / all read · attention filter · memo panel"
+            "u/U · Alt-A · N        unread row / all read · attention filter · memo panel"
         ));
         assert!(body.contains("Alt-S/L/D/T    sibling name / latest / duration / state"));
         assert!(body.contains("Alt-I / Alt-E  inspector / persistent event inbox"));
@@ -32086,12 +32076,12 @@ sort = ["state"]
     }
 
     #[test]
-    fn memo_panel_can_blur_refocus_and_close() {
+    fn memo_panel_can_blur_and_refocus() {
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        assert_eq!(app.memo_panel.state, MemoPanelState::Closed);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Open);
         assert!(matches!(
             handle_event(
-                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE)),
                 &mut app,
             ),
             Action::None
@@ -32121,28 +32111,44 @@ sort = ["state"]
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
-            (0..24)
-                .any(|y| row_text(terminal.backend().buffer(), y).contains("memo · Ctrl-N edit")),
+            (0..24).any(|y| row_text(terminal.backend().buffer(), y).contains("Note")),
             "the blurred memo remains visible"
         );
 
         assert!(matches!(
             handle_event(
-                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE)),
                 &mut app,
             ),
             Action::None
         ));
         assert_eq!(app.memo_panel.state, MemoPanelState::Focused);
-        assert!(matches!(
-            handle_event(
-                Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
-                &mut app,
-            ),
-            Action::None
-        ));
-        assert_eq!(app.memo_panel.state, MemoPanelState::Closed);
         assert_eq!(app.memo.text, "N");
+    }
+
+    #[test]
+    fn memo_panel_renders_for_a_fresh_app() {
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(app.memo_panel.state, MemoPanelState::Open);
+        assert!((0..24).any(|y| row_text(terminal.backend().buffer(), y).contains("Note")));
+    }
+
+    #[test]
+    fn default_footer_lists_the_note_binding() {
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = three_agent_app(muxa::config::DetailConfig::default());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!((0..24).any(|y| {
+            row_text(terminal.backend().buffer(), y).contains("M  mailbox   N  note   ?  help")
+        }));
     }
 
     #[test]
@@ -32150,7 +32156,6 @@ sort = ["state"]
         let backend = TestBackend::new(140, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = three_agent_app(muxa::config::DetailConfig::default());
-        app.memo_panel.state = MemoPanelState::Open;
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -32159,10 +32164,7 @@ sort = ["state"]
         // y=16, but only inside the 70-column topology half. The inspector's
         // left border must continue through that row at full body height.
         let memo_border = row_text(buf, 16);
-        assert!(
-            memo_border.contains("memo · Ctrl-N edit"),
-            "{memo_border:?}"
-        );
+        assert!(memo_border.contains("Note"), "{memo_border:?}");
         assert_eq!(
             buf.cell((70, 16)).map(ratatui::buffer::Cell::symbol),
             Some("│")
@@ -32262,7 +32264,7 @@ sort = ["state"]
         app.keepalive_panel.open = true;
         assert!(matches!(key_action(&mut app, 'z'), Action::None));
         assert!(app.memo.text.is_empty());
-        assert_eq!(app.memo_panel.state, MemoPanelState::Closed);
+        assert_eq!(app.memo_panel.state, MemoPanelState::Open);
         assert!(app.keepalive_panel.open);
     }
 
