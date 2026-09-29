@@ -3694,6 +3694,14 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
         .map_or_else(|| s.len(), |(idx, _)| idx)
 }
 
+/// `/` only opens the skill palette at the start of a message or right
+/// after whitespace — typing a path (`/home/user/...`) mid-message must
+/// insert a literal slash instead of hijacking every `/` in it, the same
+/// way a chat client's `/command` trigger only fires at a word boundary.
+fn slash_starts_skill(text: &str, cursor: usize) -> bool {
+    cursor == 0 || text.chars().nth(cursor - 1).is_none_or(char::is_whitespace)
+}
+
 /// A transient hint pinned to the footer for ~2 s after a quick action
 /// runs (or fails). Replaces the default keybinding strip while active.
 #[derive(Debug, Clone)]
@@ -12125,7 +12133,11 @@ fn handle_ask_composer_event(code: KeyCode, modifiers: KeyModifiers, app: &mut A
             Action::None
         }
         KeyCode::Char('/') if !modifiers.contains(KeyModifiers::CONTROL) => {
-            ask.skill_palette = Some(MessageSkillPalette::default());
+            if slash_starts_skill(&ask.input, ask.cursor) {
+                ask.skill_palette = Some(MessageSkillPalette::default());
+            } else {
+                insert_str_at(&mut ask.input, &mut ask.cursor, "/");
+            }
             Action::None
         }
         KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -13112,7 +13124,11 @@ fn handle_collaboration_composer_event(
         }
         KeyCode::Char('/') if !modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(composer) = app.collaboration_composer.as_mut() {
-                composer.skill_palette = Some(MessageSkillPalette::default());
+                if slash_starts_skill(&composer.input, composer.cursor) {
+                    composer.skill_palette = Some(MessageSkillPalette::default());
+                } else {
+                    composer.insert('/');
+                }
             }
             Action::None
         }
@@ -24239,6 +24255,78 @@ mod tests {
     }
 
     #[test]
+    fn slash_starts_skill_only_at_a_word_boundary() {
+        assert!(slash_starts_skill("", 0));
+        assert!(slash_starts_skill("hello ", 6));
+        assert!(!slash_starts_skill("/home", 5));
+    }
+
+    #[test]
+    fn collaboration_slash_opens_at_boundaries_and_inserts_inside_a_path() {
+        let mut app = collaboration_watch_app();
+        open_watch_collaboration_composer(&mut app);
+
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        assert!(app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_some()));
+
+        app.collaboration_composer.as_mut().unwrap().skill_palette = None;
+        let composer = app.collaboration_composer.as_mut().unwrap();
+        composer.input = "hello ".into();
+        composer.cursor = composer.input.chars().count();
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        assert!(app
+            .collaboration_composer
+            .as_ref()
+            .is_some_and(|composer| composer.skill_palette.is_some()));
+
+        let composer = app.collaboration_composer.as_mut().unwrap();
+        composer.skill_palette = None;
+        composer.input = "/home/user".into();
+        composer.cursor = "/home".chars().count();
+        let _ =
+            handle_collaboration_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        let composer = app.collaboration_composer.as_ref().unwrap();
+        assert_eq!(composer.input, "/home//user");
+        assert!(composer.skill_palette.is_none());
+    }
+
+    #[test]
+    fn ask_slash_opens_at_boundaries_and_inserts_inside_a_path() {
+        let mut app = app_with_paneless_and_pane();
+        app.ask_composer = Some(AskComposer::default());
+
+        let _ = handle_ask_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        assert!(app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.skill_palette.is_some()));
+
+        let ask = app.ask_composer.as_mut().unwrap();
+        ask.skill_palette = None;
+        ask.input = "hello ".into();
+        ask.cursor = ask.input.chars().count();
+        let _ = handle_ask_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        assert!(app
+            .ask_composer
+            .as_ref()
+            .is_some_and(|ask| ask.skill_palette.is_some()));
+
+        let ask = app.ask_composer.as_mut().unwrap();
+        ask.skill_palette = None;
+        ask.input = "/home/user".into();
+        ask.cursor = "/home".chars().count();
+        let _ = handle_ask_composer_event(KeyCode::Char('/'), KeyModifiers::NONE, &mut app);
+        let ask = app.ask_composer.as_ref().unwrap();
+        assert_eq!(ask.input, "/home//user");
+        assert!(ask.skill_palette.is_none());
+    }
+
+    #[test]
     fn slash_palette_inserts_a_skill_then_requires_a_second_enter_to_send() {
         let mut app = collaboration_watch_app();
         app.message_skills.insert(
@@ -24283,7 +24371,7 @@ mod tests {
             .insert("review".into(), "review the current changes".into());
         open_watch_collaboration_composer(&mut app);
         let composer = app.collaboration_composer.as_mut().unwrap();
-        composer.input = "Keep this context.".into();
+        composer.input = "Keep this context.\n".into();
         composer.cursor = composer.input.chars().count();
 
         assert!(matches!(
@@ -24386,8 +24474,8 @@ mod tests {
         app.message_skills
             .insert("review".into(), "review the current changes".into());
         app.ask_composer = Some(AskComposer {
-            input: "Use this additional context.".into(),
-            cursor: "Use this additional context.".chars().count(),
+            input: "Use this additional context.\n".into(),
+            cursor: "Use this additional context.\n".chars().count(),
             ..AskComposer::default()
         });
 
