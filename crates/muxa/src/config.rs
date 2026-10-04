@@ -1146,6 +1146,14 @@ pub struct ReconcilerConfig {
     /// and preserve the historical "orphan rows persist" behaviour.
     #[serde(default = "default_paneless_stale_secs")]
     pub paneless_stale_timeout_secs: u64,
+    /// Grace period after a backend's last successful observation during
+    /// which its rows remain exempt from cross-host stale aging. This absorbs
+    /// transient scan failures while allowing chronic outages to age out.
+    ///
+    /// Default `300` (5 min), ten reconciliation intervals at the default
+    /// cadence. Set `0` to retain current-tick-only protection.
+    #[serde(default = "default_cross_host_grace_secs")]
+    pub cross_host_grace_secs: u64,
 }
 
 impl Default for ReconcilerConfig {
@@ -1157,6 +1165,7 @@ impl Default for ReconcilerConfig {
             stuck_waiting_timeout_secs: 0,
             codex_rollout_enabled: true,
             paneless_stale_timeout_secs: default_paneless_stale_secs(),
+            cross_host_grace_secs: default_cross_host_grace_secs(),
         }
     }
 }
@@ -1254,6 +1263,10 @@ fn default_screen_detect_interval_secs() -> u64 {
 fn default_paneless_stale_secs() -> u64 {
     // 24 hours — see `ReconcilerConfig::paneless_stale_timeout_secs`.
     86_400
+}
+
+fn default_cross_host_grace_secs() -> u64 {
+    300
 }
 
 fn default_discovery_interval_secs() -> u64 {

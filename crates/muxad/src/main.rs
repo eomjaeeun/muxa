@@ -2442,6 +2442,9 @@ fn spawn_reconciler_task(
     .with_paneless_stale_timeout(std::time::Duration::from_secs(
         cfg.reconciler.paneless_stale_timeout_secs,
     ))
+    .with_cross_host_grace(std::time::Duration::from_secs(
+        cfg.reconciler.cross_host_grace_secs,
+    ))
     .with_codex_sessions_root(codex_sessions_root.clone());
     let shutdown_rx = shutdown_tx.subscribe();
     let handle = tokio::spawn(runner.run(shutdown_rx));
@@ -2450,6 +2453,7 @@ fn spawn_reconciler_task(
         stuck_working_timeout_secs = cfg.reconciler.stuck_working_timeout_secs,
         stuck_waiting_timeout_secs = cfg.reconciler.stuck_waiting_timeout_secs,
         paneless_stale_timeout_secs = cfg.reconciler.paneless_stale_timeout_secs,
+        cross_host_grace_secs = cfg.reconciler.cross_host_grace_secs,
         codex_rollout_polling = codex_sessions_root.is_some(),
         "reconciler enabled",
     );

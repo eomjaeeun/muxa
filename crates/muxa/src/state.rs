@@ -449,6 +449,10 @@ pub struct Store {
     /// bounds the blast radius (handler cap + timeouts), but this invariant is
     /// what keeps lock hold time in the microsecond range to begin with.
     agents: RwLock<HashMap<String, Agent>>,
+    /// Last successful observation per backend host. A recent successful
+    /// scan keeps a transiently failing backend's rows out of the cross-host
+    /// stale sweep without weakening normal per-observation reconciliation.
+    stale_protected_at: RwLock<HashMap<HostKind, OffsetDateTime>>,
     transitions: broadcast::Sender<Transition>,
     /// Coalescing invalidation signal; independent of semantic transitions.
     changes: watch::Sender<()>,
@@ -496,6 +500,7 @@ impl Store {
         let (prompts_tx, _) = broadcast::channel(PROMPT_CHANNEL_CAPACITY);
         Self {
             agents: RwLock::default(),
+            stale_protected_at: RwLock::default(),
             transitions: tx,
             changes: watch::channel(()).0,
             prompts: prompts_tx,
@@ -1699,18 +1704,13 @@ impl Store {
     /// [`Self::mark_stale_paneless_stopped`] lets a genuinely-live remote row
     /// keep itself alive by emitting activity, while a truly dead one ages out.
     ///
-    /// `observing_kinds` is the set of hosts whose observation was *complete*
-    /// this pass — the hosts that actually answered, not merely the ones in the
-    /// backend set. A host that answers governs its own rows via reaping, so it
-    /// must be spared here; a host that *can't* answer for longer than the
-    /// inactivity window is, for our purposes, indistinguishable from a host
-    /// outside the set — its rows are never reaped by any observation, so they
-    /// must age out here or they ghost forever. Passing the complete-this-tick
-    /// set (rather than every kind in the backend set) is what closes that gap:
-    /// a chronically-incomplete host's stale rows age out, while a transiently
-    /// incomplete tick is harmless because the threshold is the (24h-default)
-    /// paneless window on `last_activity_at`, not a single tick. A row is a
-    /// candidate only when its pane id classifies to a known host
+    /// `observing_kinds` is the set of hosts currently considered safe by the
+    /// caller: those that answered this pass plus any whose last successful
+    /// observation remains inside its grace window. A host in this set governs
+    /// its own rows via reconciliation, so it must be spared here; a host that
+    /// cannot answer beyond the grace window is indistinguishable from a host
+    /// outside the backend set and must eventually age out or ghost forever.
+    /// A row is a candidate only when its pane id classifies to a known host
     /// ([`crate::backend::pane_id_host_kind`]) that is *not* in this set.
     /// Same-host rows (governed by `reconcile`) and unclassifiable/paneless
     /// rows (governed by the normal reap / `mark_stale_paneless_stopped`
@@ -2005,11 +2005,29 @@ impl Store {
         observation: &PaneObservation,
         observing_kind: HostKind,
     ) -> ReconcileReport {
+        if observation.protects_stale_rows() {
+            self.stale_protected_at
+                .write()
+                .await
+                .insert(observing_kind, OffsetDateTime::now_utc());
+        }
         if !observation.is_complete() {
             return ReconcileReport::default();
         }
         self.reconcile_hosted(&observation.panes, observing_kind)
             .await
+    }
+
+    /// Host kinds whose last complete or intentionally-partial observation
+    /// is recent enough to protect their rows from cross-host stale aging.
+    pub async fn recently_protected_kinds(&self, grace: Duration) -> Vec<HostKind> {
+        let cutoff = OffsetDateTime::now_utc() - grace;
+        self.stale_protected_at
+            .read()
+            .await
+            .iter()
+            .filter_map(|(kind, protected_at)| (*protected_at >= cutoff).then_some(*kind))
+            .collect()
     }
 
     /// Converge against a pane set already known to be complete, assuming the
@@ -2679,6 +2697,38 @@ mod tests {
             store.by_session("herdr-own").await.unwrap().state,
             AgentState::Stopped,
         );
+    }
+
+    #[tokio::test]
+    async fn recent_protection_survives_one_incomplete_observation() {
+        let store = Store::shared();
+
+        store
+            .reconcile_observation(&PaneObservation::complete(Vec::new()), HostKind::Tmux)
+            .await;
+        store
+            .reconcile_observation(&PaneObservation::incomplete(Vec::new()), HostKind::Tmux)
+            .await;
+
+        assert_eq!(
+            store.recently_protected_kinds(Duration::from_secs(1)).await,
+            vec![HostKind::Tmux],
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_protection_expires_without_another_successful_observation() {
+        let store = Store::shared();
+
+        store
+            .reconcile_observation(&PaneObservation::complete(Vec::new()), HostKind::Tmux)
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(store
+            .recently_protected_kinds(Duration::from_millis(5))
+            .await
+            .is_empty());
     }
 
     #[tokio::test]

@@ -144,6 +144,9 @@ pub struct Reconciler<L: LivenessSource> {
     /// codex rows from detached `app-server`/remote sessions that no other
     /// converge path governs.
     paneless_stale_timeout: Duration,
+    /// How long a host remains protected from cross-host stale aging after
+    /// its last complete or intentionally-partial observation.
+    cross_host_grace: Duration,
     /// Root of codex's session-rollout tree (`~/.codex/sessions`). When
     /// `Some`, each tick reads every live codex row's rollout file and
     /// feeds its `rate_limits` through the store — the only way muxa learns
@@ -179,6 +182,7 @@ impl<L: LivenessSource> Reconciler<L> {
             stuck_working_timeout: Duration::ZERO,
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
+            cross_host_grace: interval.saturating_mul(10),
             codex_sessions_root: None,
         }
     }
@@ -216,6 +220,14 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_paneless_stale_timeout(mut self, t: Duration) -> Self {
         self.paneless_stale_timeout = t;
+        self
+    }
+
+    /// Keep a recently observed host out of the cross-host stale sweep for
+    /// `t`, absorbing transient scan failures while chronic failures age out.
+    #[must_use]
+    pub fn with_cross_host_grace(mut self, t: Duration) -> Self {
+        self.cross_host_grace = t;
         self
     }
 
@@ -414,8 +426,9 @@ impl<L: LivenessSource> Reconciler<L> {
         // but their successful partial observation still proves the host is
         // structurally present and must protect hook rows from cross-host
         // stale aging. Transiently incomplete/failed scans do not join this
-        // set and retain the existing 24h age-out behavior.
-        let stale_protected_kinds: Vec<HostKind> = observations
+        // set. Recent successful scans are added below so one transient miss
+        // cannot expose already-idle rows to the cross-host sweep.
+        let mut stale_protected_kinds: Vec<HostKind> = observations
             .iter()
             .filter(|(_, o)| o.protects_stale_rows())
             .map(|(k, _)| *k)
@@ -516,17 +529,26 @@ impl<L: LivenessSource> Reconciler<L> {
                 "orphan-row sweep flipped {stale_paneless} paneless agent(s) to Stopped",
             );
         }
+        for kind in self
+            .store
+            .recently_protected_kinds(self.cross_host_grace)
+            .await
+        {
+            if !stale_protected_kinds.contains(&kind) {
+                stale_protected_kinds.push(kind);
+            }
+        }
         // Age out rows whose pane belongs to a host that neither answered with
         // a complete observation nor intentionally exposes a partial namespace
-        // this tick (e.g. a `zellij:` row while the set is tmux + herdr, a
+        // recently (e.g. a `zellij:` row while the set is tmux + herdr, a
         // `herdr:` row left behind after narrowing the set back to tmux, or a
         // normally-authoritative host that is chronically unable to answer).
         // The cross-host guard exempts foreign rows from *immediate* reaping,
         // and no observation reaps them, so without this they'd ghost forever.
-        // Pass complete + intentionally-partial kinds, not every configured
-        // kind. A failed authoritative host still ages out after the inactivity
-        // window, while a structurally partial host such as cmux never turns an
-        // unobserved-but-valid surface into a false Stopped row.
+        // Pass complete + intentionally-partial kinds and kinds that answered
+        // within the grace window, not every configured kind. A chronically
+        // failed authoritative host still ages out, while a transient failure
+        // and a structurally partial host such as cmux remain safe.
         let stale_cross_host = self
             .store
             .mark_stale_cross_host_stopped(&stale_protected_kinds, self.paneless_stale_timeout)
@@ -691,6 +713,9 @@ mod tests {
         }
         fn set(&self, panes: Vec<PaneInfo>) {
             *self.observation.lock().unwrap() = PaneObservation::complete(panes);
+        }
+        fn set_incomplete(&self, panes: Vec<PaneInfo>) {
+            *self.observation.lock().unwrap() = PaneObservation::incomplete(panes);
         }
     }
 
@@ -910,6 +935,39 @@ mod tests {
                 .map(|a| a.state),
             Some(AgentState::Idle),
             "a freshly-active row on the same host survives",
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_incomplete_observation_keeps_recent_host_protected() {
+        let store = Store::shared();
+        let old = datetime!(2026-04-24 12:00:00 UTC);
+        store.apply(&started("tmux-idle", "%1", old)).await;
+
+        let source = Arc::new(FakeLiveness::new(vec![pane("%1")]));
+        let r = Reconciler::new(
+            store.clone(),
+            ArcLiveness(source.clone()),
+            Duration::from_millis(10),
+        )
+        .with_paneless_stale_timeout(Duration::from_secs(1))
+        .with_cross_host_grace(Duration::from_secs(1));
+
+        r.reconcile_once().await;
+        source.set_incomplete(Vec::new());
+        r.reconcile_once().await;
+        assert_eq!(
+            store.by_session("tmux-idle").await.map(|agent| agent.state),
+            Some(AgentState::Idle),
+            "one failed scan must retain protection from the preceding complete scan",
+        );
+
+        source.set(vec![pane("%1")]);
+        r.reconcile_once().await;
+        assert_eq!(
+            store.by_session("tmux-idle").await.map(|agent| agent.state),
+            Some(AgentState::Idle),
+            "the complete-incomplete-complete sequence preserves the live row",
         );
     }
 
