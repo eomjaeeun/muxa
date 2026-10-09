@@ -535,8 +535,9 @@ impl WatchColumn {
 
     fn default_width(self) -> Constraint {
         match self {
-            // PANE — "session:window.pane" can run long; 22 covers most.
-            Self::Pane => Constraint::Length(22),
+            // PANE — "session:window.pane" can run long; 26 leaves room for
+            // the state-summary gutter while still covering most names.
+            Self::Pane => Constraint::Length(26),
             Self::Kind | Self::StateAge => Constraint::Length(12),
             // STATE — compact colored state marker; full state remains
             // available in detail placeholders and structured snapshots.
@@ -7390,7 +7391,7 @@ const STATE_SUMMARY_ORDER: [AgentState; 7] = [
     AgentState::Stopped,
 ];
 
-const WORK_STATE_GUTTER_WIDTH: usize = 6;
+const WORK_STATE_GUTTER_WIDTH: usize = 10;
 const WORK_STATE_GUTTER_CONTENT_WIDTH: usize = WORK_STATE_GUTTER_WIDTH - 1;
 
 #[derive(Clone)]
@@ -18941,7 +18942,9 @@ impl WorkTableColumn {
 
     fn constraint(self) -> Constraint {
         match self {
-            Self::State => Constraint::Length(7),
+            Self::State => Constraint::Length(
+                u16::try_from(WORK_STATE_GUTTER_WIDTH).expect("state gutter width fits u16"),
+            ),
             Self::Work | Self::Cwd => Constraint::Min(16),
             Self::Workspace => Constraint::Length(16),
             Self::Generation | Self::Done => Constraint::Length(5),
@@ -19134,7 +19137,10 @@ impl TopologyTableColumn {
 
     fn constraint(self) -> Constraint {
         match self {
-            Self::State | Self::Age => Constraint::Length(7),
+            Self::State => Constraint::Length(
+                u16::try_from(WORK_STATE_GUTTER_WIDTH).expect("state gutter width fits u16"),
+            ),
+            Self::Age => Constraint::Length(7),
             Self::Node => Constraint::Min(24),
             Self::Summary => Constraint::Min(18),
         }
@@ -19430,13 +19436,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // truncated names were the whole reason to fold — but with a ceiling:
     // a name column that swallows every freed column just trades an
     // unreadable summary for a field of trailing blanks. 30 covers the
-    // 8-cell status gutter plus a 22-character session name.
+    // 12-cell status gutter plus a 22-character session name.
     let summary_folded = columns.len() != app.columns.len();
     let widths: Vec<Constraint> = columns
         .iter()
         .map(|c| {
             if summary_folded && matches!(c, WatchColumn::Pane) {
-                Constraint::Max(30)
+                Constraint::Max(34)
             } else {
                 resolve_width(*c, &app.watch_cfg)
             }
@@ -21700,6 +21706,21 @@ mod tests {
                 "{state:?} must not change colour for unread"
             );
         }
+    }
+
+    #[test]
+    fn state_summary_gutter_keeps_state_information_before_overflow() {
+        let theme = watch_theme(WatchTheme::Classic);
+        let states = std::iter::repeat_n(AgentState::Error, 2)
+            .chain(std::iter::repeat_n(AgentState::Working, 11))
+            .chain(std::iter::repeat_n(AgentState::Idle, 11));
+
+        let label = state_summary_gutter_spans(states, false, theme, Spinner::OFF)
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert_eq!(label.trim_end(), "■2 +22");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -26963,7 +26984,7 @@ mod tests {
             Spinner::OFF,
             app.watch_cfg.summary,
         );
-        assert_eq!(plain_text(&text), "■ +4  main › window 0");
+        assert_eq!(plain_text(&text), "■ ▶ ●2 ○  main › window 0");
     }
 
     #[test]
@@ -27088,7 +27109,7 @@ mod tests {
             Spinner::OFF,
             app.watch_cfg.summary,
         );
-        assert_eq!(plain_text(&text), "▶     main › window 0");
+        assert_eq!(plain_text(&text), "▶         main › window 0");
     }
 
     #[test]
@@ -27148,8 +27169,8 @@ mod tests {
             display_col_of(&labels["single"], "single"),
             Some(WORK_STATE_GUTTER_WIDTH)
         );
-        assert_eq!(labels["multi"], "▶ ●   multi › window 0");
-        assert_eq!(labels["single"], "○     single › window 0");
+        assert_eq!(labels["multi"], "▶ ●       multi › window 0");
+        assert_eq!(labels["single"], "○         single › window 0");
     }
 
     #[test]
@@ -27214,7 +27235,7 @@ mod tests {
             display_col_of(&label, "crowded"),
             Some(WORK_STATE_GUTTER_WIDTH)
         );
-        assert_eq!(label, "■ +6  crowded › window 0");
+        assert_eq!(label, "■ ▶ ◆ +4  crowded › window 0");
     }
 
     #[test]
