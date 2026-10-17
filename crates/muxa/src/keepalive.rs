@@ -155,6 +155,12 @@ impl KeepaliveStore {
         self.entries.write().await.remove(pane).is_some()
     }
 
+    /// Immediately treat `panes` as focused. The next tmux focus sample
+    /// replaces this seed with the current attached-client state.
+    pub async fn mark_focused(&self, panes: impl IntoIterator<Item = String>) {
+        self.focused_panes.write().await.extend(panes);
+    }
+
     pub async fn list(&self) -> Vec<KeepaliveInfo> {
         let entries = self.entries.read().await;
         let focused_panes = self.focused_panes.read().await;
@@ -199,7 +205,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        store.focused_panes.write().await.insert("%1".into());
+        store.mark_focused(["%1".into()]).await;
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1, "paused tick must not fire");

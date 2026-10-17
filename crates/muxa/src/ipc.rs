@@ -538,6 +538,12 @@ enum RequestBody {
     },
     /// Every live schedule. Answers in `keepalive_list`.
     KeepaliveList {},
+    /// Seed the live focused-pane set immediately before a watch jump. The
+    /// next tmux focus poll replaces it with the observed client state.
+    /// Answers with the refreshed schedule list.
+    KeepaliveMark {
+        panes: Vec<String>,
+    },
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -3709,6 +3715,11 @@ async fn handle(
                     kind = "keepalive_list";
                     Response::with_keepalive_list(keepalive.list().await)
                 }
+                RequestBody::KeepaliveMark { panes } => {
+                    kind = "keepalive_mark";
+                    keepalive.mark_focused(panes).await;
+                    Response::with_keepalive_list(keepalive.list().await)
+                }
                 RequestBody::CollaborationSend {
                     origin,
                     target,
@@ -5417,6 +5428,20 @@ impl Client {
     /// Every live schedule, oldest first.
     pub async fn keepalive_list(&self) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "keepalive_list" });
+        let resp = self.call_checked(&req).await?;
+        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// Immediately mark panes focused before jumping into their window.
+    pub async fn keepalive_mark(
+        &self,
+        panes: &[String],
+    ) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "keepalive_mark",
+            "panes": panes,
+        });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
     }
@@ -7734,6 +7759,9 @@ mod tests {
         let list = client.keepalive_start("%1", 10).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].interval_secs, 10);
+
+        let list = client.keepalive_mark(&["%1".to_string()]).await.unwrap();
+        assert!(list[0].paused, "watch seeds focus before jumping");
 
         let list = client.keepalive_stop("%1").await.unwrap();
         assert!(list.is_empty());
