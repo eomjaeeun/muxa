@@ -18,9 +18,8 @@
 //! Schedules are in-memory only. A muxad restart drops them, same as it
 //! would drop the shell loop this replaces; nothing here is durable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tracing::warn;
+
+const FOCUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One schedule as reported to a client — the live fields, not the task
 /// handle backing it.
@@ -43,7 +45,6 @@ pub struct KeepaliveInfo {
 struct Entry {
     interval_secs: u64,
     started_at: OffsetDateTime,
-    paused: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -58,6 +59,16 @@ impl Drop for Entry {
 /// rather than stacking two loops on the same target.
 pub struct KeepaliveStore {
     entries: RwLock<HashMap<String, Entry>>,
+    focused_panes: Arc<RwLock<HashSet<String>>>,
+    focus_task: Option<JoinHandle<()>>,
+}
+
+impl Drop for KeepaliveStore {
+    fn drop(&mut self) {
+        if let Some(task) = &self.focus_task {
+            task.abort();
+        }
+    }
 }
 
 impl KeepaliveStore {
@@ -65,6 +76,32 @@ impl KeepaliveStore {
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
             entries: RwLock::new(HashMap::new()),
+            focused_panes: Arc::new(RwLock::new(HashSet::new())),
+            focus_task: None,
+        })
+    }
+
+    /// Create the daemon store and continuously track panes displayed by real
+    /// (non-control-mode) tmux clients.
+    #[must_use]
+    pub fn with_tmux_focus_tracking() -> Arc<Self> {
+        let focused_panes = Arc::new(RwLock::new(HashSet::new()));
+        let task_focused_panes = Arc::clone(&focused_panes);
+        let focus_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(FOCUS_POLL_INTERVAL);
+            loop {
+                ticker.tick().await;
+                match tokio::task::spawn_blocking(crate::tmux::focused_panes).await {
+                    Ok(Ok(sample)) => *task_focused_panes.write().await = sample,
+                    Ok(Err(error)) => warn!(%error, "could not poll tmux client focus"),
+                    Err(error) => warn!(%error, "tmux focus poll task failed"),
+                }
+            }
+        });
+        Arc::new(Self {
+            entries: RwLock::new(HashMap::new()),
+            focused_panes,
+            focus_task: Some(focus_task),
         })
     }
 
@@ -79,10 +116,8 @@ impl KeepaliveStore {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let interval_secs = interval.as_secs().max(1);
-        let paused = Arc::new(AtomicBool::new(false));
         let started_at = OffsetDateTime::now_utc();
         let task_pane = pane.clone();
-        let task_paused = paused.clone();
         let store = self.clone();
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -91,7 +126,7 @@ impl KeepaliveStore {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if !task_paused.load(Ordering::SeqCst) {
+                if !store.focused_panes.read().await.contains(&task_pane) {
                     tick(task_pane.clone()).await;
                 }
                 // The entry (and with it, this task's own membership) may
@@ -110,7 +145,6 @@ impl KeepaliveStore {
             Entry {
                 interval_secs,
                 started_at,
-                paused,
                 task,
             },
         );
@@ -121,35 +155,15 @@ impl KeepaliveStore {
         self.entries.write().await.remove(pane).is_some()
     }
 
-    /// Pause `pane`'s schedule in place — the schedule stays listed, just
-    /// skips ticks. `true` if a schedule exists for `pane` (whether or not
-    /// it was already paused).
-    pub async fn pause(&self, pane: &str) -> bool {
-        let entries = self.entries.read().await;
-        let Some(entry) = entries.get(pane) else {
-            return false;
-        };
-        entry.paused.store(true, Ordering::SeqCst);
-        true
-    }
-
-    /// Lift every pause. Called once when `watch` starts: the operator is
-    /// back at the console, so anything held for their benefit resumes.
-    pub async fn resume_all(&self) {
-        let entries = self.entries.read().await;
-        for entry in entries.values() {
-            entry.paused.store(false, Ordering::SeqCst);
-        }
-    }
-
     pub async fn list(&self) -> Vec<KeepaliveInfo> {
         let entries = self.entries.read().await;
+        let focused_panes = self.focused_panes.read().await;
         let mut list: Vec<KeepaliveInfo> = entries
             .iter()
             .map(|(pane, entry)| KeepaliveInfo {
                 pane: pane.clone(),
                 interval_secs: entry.interval_secs,
-                paused: entry.paused.load(Ordering::SeqCst),
+                paused: focused_panes.contains(pane),
                 started_at: entry.started_at,
             })
             .collect();
@@ -161,10 +175,10 @@ impl KeepaliveStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[tokio::test(start_paused = true)]
-    async fn ticks_the_configured_number_of_times_and_skips_while_paused() {
+    async fn ticks_the_configured_number_of_times_and_skips_while_focused() {
         let store = KeepaliveStore::in_memory();
         let count = Arc::new(AtomicU32::new(0));
         let counting = count.clone();
@@ -185,12 +199,12 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        assert!(store.pause("%1").await);
+        store.focused_panes.write().await.insert("%1".into());
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1, "paused tick must not fire");
 
-        store.resume_all().await;
+        store.focused_panes.write().await.clear();
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 2);
@@ -215,11 +229,5 @@ mod tests {
         assert!(store.stop("%1").await);
         assert!(store.list().await.is_empty());
         assert!(!store.stop("%1").await, "already gone");
-    }
-
-    #[tokio::test]
-    async fn pause_on_an_unknown_pane_reports_false() {
-        let store = KeepaliveStore::in_memory();
-        assert!(!store.pause("%nope").await);
     }
 }

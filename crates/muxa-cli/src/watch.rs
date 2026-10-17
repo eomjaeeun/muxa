@@ -5922,23 +5922,6 @@ impl App {
         self.read_marks.flush();
     }
 
-    /// Every pane shown alongside `pane_id` in its tmux window.
-    fn window_pane_ids(&self, pane_id: &str) -> Vec<String> {
-        self.topology
-            .sessions
-            .iter()
-            .flat_map(|session| &session.windows)
-            .find(|window| window.panes.iter().any(|pane| pane.key.pane_id == pane_id))
-            .map(|window| {
-                window
-                    .panes
-                    .iter()
-                    .map(|pane| pane.key.pane_id.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Keep the read-marks file bounded. Deliberately not "forget everyone the
     /// snapshot did not name" — see [`ReadMarks::bound`] for why a snapshot is
     /// not evidence of absence.
@@ -6190,17 +6173,6 @@ impl App {
             level,
             set_at: Instant::now(),
         });
-    }
-}
-
-/// Pause every keepalive visible when the operator arrives. Preserve the
-/// single-pane baseline if a stale attach target is absent from the snapshot.
-fn keepalive_pause_targets(app: &App, pane_id: &str) -> Vec<String> {
-    let targets = app.window_pane_ids(pane_id);
-    if targets.is_empty() {
-        vec![pane_id.to_string()]
-    } else {
-        targets
     }
 }
 
@@ -8610,12 +8582,6 @@ pub async fn run(
     sort_persist_path: Option<PathBuf>,
     caller_pane: Option<String>,
 ) -> Result<Option<WatchOpenTarget>> {
-    // The operator is back at the console: lift whatever `AttachPane`/
-    // `AttachTopologyPane` paused on a previous jump out of `watch`. Every
-    // launch resumes everything rather than tracking which jump caused
-    // which pause — simpler, and correct for the common case of jumping to
-    // one pane and coming straight back here.
-    let _ = client.keepalive_resume_all().await;
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
 
@@ -8817,26 +8783,13 @@ pub async fn run(
                 // whole window clears, because arriving shows the whole
                 // window.
                 Action::AttachPane(pane) => {
-                    let keepalive_targets = keepalive_pause_targets(&app, &pane);
                     app.mark_window_read(&pane);
-                    // Best-effort: the operator is about to sit in this
-                    // window, so an unattended Enter in any visible pane is
-                    // the one outcome a keepalive schedule must never cause.
-                    // A daemon that can't be reached leaves nothing paused,
-                    // same as before this existed.
-                    for target in keepalive_targets {
-                        let _ = client.keepalive_pause(&target).await;
-                    }
                     jump_target = Some(WatchOpenTarget::LegacyPane(pane));
                     quit = true;
                     break;
                 }
                 Action::AttachTopologyPane(pane) => {
-                    let keepalive_targets = keepalive_pause_targets(&app, &pane.pane_id);
                     app.mark_window_read(&pane.pane_id);
-                    for target in keepalive_targets {
-                        let _ = client.keepalive_pause(&target).await;
-                    }
                     jump_target = Some(WatchOpenTarget::TopologyPane(pane));
                     quit = true;
                     break;
@@ -21355,52 +21308,6 @@ mod tests {
             Action::SubmitKeepalive { ref panes, interval_secs: 5 }
                 if panes == &["%21".to_string(), "%32".to_string()]
         ));
-    }
-
-    #[test]
-    fn attaching_to_a_pane_pauses_every_keepalive_in_its_window() {
-        let app = two_pane_window_app();
-
-        assert_eq!(
-            keepalive_pause_targets(&app, "%21"),
-            vec!["%21".to_string(), "%32".to_string()]
-        );
-    }
-
-    #[test]
-    fn attach_pause_targets_include_non_agent_panes_in_the_window() {
-        let mut app = two_pane_window_app();
-        app.set_data(
-            vec![fake_agent(
-                "first",
-                Some("%21"),
-                AgentKind::ClaudeCode,
-                AgentState::Idle,
-                None,
-                None,
-                None,
-                None,
-            )],
-            vec![
-                fake_pane("%21", "vuln", 0, 0, "claude"),
-                fake_pane("%32", "vuln", 0, 1, "bash"),
-            ],
-        );
-
-        assert_eq!(
-            keepalive_pause_targets(&app, "%21"),
-            vec!["%21".to_string(), "%32".to_string()]
-        );
-    }
-
-    #[test]
-    fn attaching_to_a_pane_missing_from_topology_still_pauses_that_pane() {
-        let app = two_pane_window_app();
-
-        assert_eq!(
-            keepalive_pause_targets(&app, "%99"),
-            vec!["%99".to_string()]
-        );
     }
 
     #[test]

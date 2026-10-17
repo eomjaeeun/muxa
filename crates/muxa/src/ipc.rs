@@ -538,16 +538,6 @@ enum RequestBody {
     },
     /// Every live schedule. Answers in `keepalive_list`.
     KeepaliveList {},
-    /// Hold `pane`'s schedule without removing it — `watch` sends this
-    /// right before jumping the operator into that exact pane, so an
-    /// automatic Enter never lands on something they are mid-typing.
-    /// Answers with the refreshed schedule list.
-    KeepalivePause {
-        pane: String,
-    },
-    /// Lift every pause. `watch` sends this once on startup: the operator
-    /// is back at the console. Answers with the refreshed schedule list.
-    KeepaliveResumeAll {},
     CollaborationInbox {
         origin: CollaborationOrigin,
     },
@@ -3677,7 +3667,10 @@ async fn handle(
                         Err(error) => Response::err(error),
                     }
                 }
-                RequestBody::KeepaliveStart { pane, interval_secs } => {
+                RequestBody::KeepaliveStart {
+                    pane,
+                    interval_secs,
+                } => {
                     kind = "keepalive_start";
                     let interval = Duration::from_secs(interval_secs.max(1));
                     let tick_backends = backends.clone();
@@ -3714,16 +3707,6 @@ async fn handle(
                 }
                 RequestBody::KeepaliveList {} => {
                     kind = "keepalive_list";
-                    Response::with_keepalive_list(keepalive.list().await)
-                }
-                RequestBody::KeepalivePause { pane } => {
-                    kind = "keepalive_pause";
-                    keepalive.pause(&pane).await;
-                    Response::with_keepalive_list(keepalive.list().await)
-                }
-                RequestBody::KeepaliveResumeAll {} => {
-                    kind = "keepalive_resume_all";
-                    keepalive.resume_all().await;
                     Response::with_keepalive_list(keepalive.list().await)
                 }
                 RequestBody::CollaborationSend {
@@ -5434,28 +5417,6 @@ impl Client {
     /// Every live schedule, oldest first.
     pub async fn keepalive_list(&self) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
         let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "keepalive_list" });
-        let resp = self.call_checked(&req).await?;
-        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
-    }
-
-    /// Hold `pane`'s schedule without removing it — `watch` calls this right
-    /// before jumping the operator into that exact pane.
-    pub async fn keepalive_pause(&self, pane: &str) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
-        let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "kind": "keepalive_pause",
-            "pane": pane,
-        });
-        let resp = self.call_checked(&req).await?;
-        serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
-    }
-
-    /// Lift every pause. `watch` calls this once on startup.
-    pub async fn keepalive_resume_all(&self) -> Result<Vec<KeepaliveInfo>, RuntimeError> {
-        let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "kind": "keepalive_resume_all",
-        });
         let resp = self.call_checked(&req).await?;
         serde_json::from_value(resp["keepalive_list"].clone()).map_err(RuntimeError::Json)
     }
@@ -7752,7 +7713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keepalive_schedules_start_pause_resume_and_stop_over_ipc() {
+    async fn keepalive_schedules_start_list_and_stop_over_ipc() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("muxa-keepalive.sock");
         let server = Server::new(sock.clone(), Store::shared());
@@ -7773,12 +7734,6 @@ mod tests {
         let list = client.keepalive_start("%1", 10).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].interval_secs, 10);
-
-        let list = client.keepalive_pause("%1").await.unwrap();
-        assert!(list[0].paused, "watch pauses the schedule before jumping in");
-
-        let list = client.keepalive_resume_all().await.unwrap();
-        assert!(!list[0].paused, "watch resumes everything on startup");
 
         let list = client.keepalive_stop("%1").await.unwrap();
         assert!(list.is_empty());

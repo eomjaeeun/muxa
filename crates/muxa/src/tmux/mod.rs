@@ -10,6 +10,7 @@
 pub mod layout;
 pub mod scanner;
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -665,6 +666,7 @@ pub(crate) const SESSION_FMT: &str =
     "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_group}";
 pub(crate) const CLIENT_FMT: &str =
     "#{client_name}\t#{client_session}\t#{client_control_mode}\t#{client_activity}\t#{client_created}\t#{pane_in_mode}";
+const FOCUS_FMT: &str = "#{pane_id}\t#{session_name}\t#{window_active}\t#{pane_active}";
 
 /// Parse the `\t`-separated stdout of `tmux list-panes -F PANE_FMT` into
 /// `PaneInfo` rows. Lines with too few columns are silently skipped — the
@@ -942,6 +944,58 @@ pub fn list_clients() -> Result<Vec<ClientInfo>, TmuxError> {
     }
     let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
     Ok(parse_client_lines(&stdout))
+}
+
+/// Pane ids currently displayed by interactive tmux clients.
+///
+/// This deliberately joins two server-wide inventories instead of using an
+/// unpinned `display-message`: the latter resolves against tmux's last-active
+/// client and is therefore wrong as soon as two terminals are attached.
+pub fn focused_panes() -> Result<HashSet<String>, TmuxError> {
+    let clients = match list_clients() {
+        Ok(clients) => clients,
+        Err(TmuxError::NonZero(message))
+            if message.trim_start().starts_with("no server running") =>
+        {
+            return Ok(HashSet::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let interactive_sessions: HashSet<String> = clients
+        .into_iter()
+        .filter(|client| !client.control_mode)
+        .map(|client| client.session)
+        .collect();
+    if interactive_sessions.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let out = tmux_output(&["list-panes", "-a", "-F", FOCUS_FMT])?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
+    Ok(parse_focused_pane_lines(&stdout, &interactive_sessions))
+}
+
+fn parse_focused_pane_lines(
+    stdout: &str,
+    interactive_sessions: &HashSet<String>,
+) -> HashSet<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            let pane = cols.next()?;
+            let session = cols.next()?;
+            let window_active = cols.next()?;
+            let pane_active = cols.next()?;
+            (interactive_sessions.contains(session) && window_active == "1" && pane_active == "1")
+                .then(|| pane.to_string())
+        })
+        .collect()
 }
 
 pub fn inside_tmux() -> bool {
@@ -1649,6 +1703,17 @@ mod tests {
         assert_eq!(sessions[0].name, "main");
         assert_eq!(sessions[0].attached_clients, 1);
         assert_eq!(sessions[1].attached_clients, 0);
+    }
+
+    #[test]
+    fn focused_panes_join_interactive_client_sessions_with_active_rows() {
+        let sessions = HashSet::from(["main".to_string(), "other".to_string()]);
+        let panes = parse_focused_pane_lines(
+            "%1\tmain\t1\t1\n%2\tmain\t1\t0\n%3\tmain\t0\t1\n%4\tother\t1\t1\n%5\tautomation\t1\t1\n",
+            &sessions,
+        );
+
+        assert_eq!(panes, HashSet::from(["%1".to_string(), "%4".to_string()]));
     }
 
     #[test]

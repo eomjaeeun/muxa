@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn tool_result_quoting_the_phrase_is_not_a_rate_limit() {
         for quote in [
-            r#"of them hits `You've hit your limit · resets 2:40pm`, and the session sits"#,
+            r"of them hits `You've hit your limit · resets 2:40pm`, and the session sits",
             r#"58:    /// before the failure (e.g., `\"You've hit your limit · resets …\"`)."#,
             r#"if text.contains(\"You've hit your limit\") || text.contains(\"Claude usage limit reached\")"#,
         ] {

@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
     let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg, config_path.clone()).await;
     let automation = build_automation(&cfg, config_path.clone());
-    let keepalive = muxa::keepalive::KeepaliveStore::in_memory();
+    let keepalive = muxa::keepalive::KeepaliveStore::with_tmux_focus_tracking();
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
 
