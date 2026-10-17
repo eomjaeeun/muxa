@@ -727,7 +727,8 @@ pub struct PipelineAgentConfig {
     pub after: Vec<String>,
 }
 
-/// `[collaboration]` config — same-window durable agent request/reply.
+/// `[collaboration]` config — durable agent request/reply, window-scoped by
+/// default and optionally host-wide.
 /// Disabled by default because idle wake-up injects a prompt into a peer pane.
 /// Enabling it is an explicit grant for local peer coordination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,13 +748,12 @@ pub struct CollaborationConfig {
     /// keeping agent-originated requests in the mailbox. `full` directly
     /// delivers every request.
     pub wake_payload: CollaborationWakePayload,
-    /// How far an explicit `pane:%N` target may reach. `window` (default)
-    /// keeps requests inside the sender's tmux window — co-locating agents
-    /// in a window is the consent to let them talk. `host` lets a request
-    /// address any tracked agent pane on this host, which is what makes
-    /// `muxa watch`'s composer work against whatever row the cursor is on.
-    /// `peer` / `@alias` / `role:` stay window-scoped either way: they are
-    /// room concepts, and host-wide alias matching would invite misdelivery.
+    /// How far collaboration addressing and peer discovery may reach.
+    /// `window` (default) keeps requests inside the sender's tmux window —
+    /// co-locating agents in a window is the consent to let them talk. `host`
+    /// exposes every tracked agent on this host to all selector kinds and to
+    /// peer listing. Aliases remain room-locally unique, so a duplicate alias
+    /// across rooms is rejected as an ambiguous host-wide target.
     pub scope: CollaborationScope,
     #[serde(default = "default_collaboration_max_message_bytes")]
     pub max_message_bytes: usize,

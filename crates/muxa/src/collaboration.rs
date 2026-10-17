@@ -1,4 +1,5 @@
-//! Durable, same-room request/reply collaboration for pane-hosted agents.
+//! Durable request/reply collaboration for pane-hosted agents, scoped to a
+//! room by default or widened to the host by configuration.
 //!
 //! tmux supplies topology; muxad remains the broker. Messages are pinned to
 //! the concrete agent session occupying a pane so a later process reusing the
@@ -1500,8 +1501,8 @@ pub struct CollaborationStore {
 }
 
 impl CollaborationStore {
-    /// The configured reach of explicit pane targets. Read by the IPC send
-    /// handler; everything else stays window-scoped regardless.
+    /// The configured reach of collaboration addressing and peer discovery.
+    /// Read by the IPC handlers that resolve targets and build room context.
     pub fn scope(&self) -> crate::config::CollaborationScope {
         self.opts.scope
     }
@@ -2739,11 +2740,9 @@ pub fn resolve_target(
     participants: &[Participant],
     scope: crate::config::CollaborationScope,
 ) -> Result<Participant, CollaborationError> {
-    // Host scope widens *explicit pane* targets only. `peer`, `@alias` and
-    // `role:` remain room concepts: a pane id is unique on the host, but an
-    // alias is only unique among live peers of one room, and matching it
-    // host-wide would deliver to whichever unrelated agent happens to share
-    // the name.
+    // Host scope removes the room restriction for every selector kind. Keep
+    // this explicit-pane path so pane targets retain their established direct
+    // lookup and ambiguity behavior across tmux endpoints.
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
         if pane.starts_with('%') {
@@ -2760,7 +2759,11 @@ pub fn resolve_target(
     }
     let peers: Vec<_> = participants
         .iter()
-        .filter(|candidate| candidate.room == sender.room && !candidate.same_endpoint(sender))
+        .filter(|candidate| {
+            !candidate.same_endpoint(sender)
+                && (scope == crate::config::CollaborationScope::Host
+                    || candidate.room == sender.room)
+        })
         .collect();
     if selector == "peer" {
         return match peers.as_slice() {
@@ -3042,11 +3045,14 @@ pub async fn room_context(
     mailbox: &CollaborationStore,
     current: Participant,
     participants: &[Participant],
+    scope: crate::config::CollaborationScope,
 ) -> RoomContext {
     let peers = participants
         .iter()
         .filter(|participant| {
-            participant.room == current.room && !participant.same_endpoint(&current)
+            !participant.same_endpoint(&current)
+                && (scope == crate::config::CollaborationScope::Host
+                    || participant.room == current.room)
         })
         .cloned()
         .collect();
@@ -4693,28 +4699,85 @@ mod tests {
     }
 
     #[test]
-    fn host_scope_reaches_panes_in_other_rooms_but_room_selectors_do_not() {
+    fn host_scope_reaches_every_selector_in_other_rooms() {
         let sender = participant("%1", "s1");
-        let mut peers = vec![participant("%2", "s2")];
         let mut other_room = participant("%99", "s99");
         other_room.room.window_id = "@other".into();
-        peers.push(other_room);
+        other_room.alias = Some("reviewer".into());
+        other_room.roles = vec!["review".into()];
+        let peers = vec![sender.clone(), other_room];
 
-        assert_eq!(
-            resolve_target(&sender, "%99", &peers, CollaborationScope::Host)
-                .unwrap()
-                .pane,
-            "%99"
-        );
-        // Same target, default scope: refused — co-location is the consent.
-        assert!(resolve_target(&sender, "%99", &peers, CollaborationScope::Window).is_err());
-        // `peer` stays a room concept even under host scope.
-        assert_eq!(
-            resolve_target(&sender, "peer", &peers, CollaborationScope::Host)
-                .unwrap()
-                .pane,
-            "%2"
-        );
+        for selector in ["%99", "pane:%99", "peer", "@reviewer", "role:review"] {
+            assert_eq!(
+                resolve_target(&sender, selector, &peers, CollaborationScope::Host)
+                    .unwrap()
+                    .pane,
+                "%99"
+            );
+        }
+    }
+
+    #[test]
+    fn window_scope_refuses_every_selector_in_other_rooms() {
+        let sender = participant("%1", "s1");
+        let mut other_room = participant("%99", "s99");
+        other_room.room.window_id = "@other".into();
+        other_room.alias = Some("reviewer".into());
+        other_room.roles = vec!["review".into()];
+        let peers = vec![sender.clone(), other_room];
+
+        for selector in ["%99", "pane:%99", "peer", "@reviewer", "role:review"] {
+            assert!(resolve_target(&sender, selector, &peers, CollaborationScope::Window).is_err());
+        }
+    }
+
+    #[test]
+    fn host_scope_duplicate_room_local_alias_is_ambiguous() {
+        let sender = participant("%1", "s1");
+        let mut first = participant_in_window("%2", "s2", "@2");
+        first.alias = Some("samealias".into());
+        let mut second = participant_in_window("%3", "s3", "@3");
+        second.alias = Some("samealias".into());
+
+        assert!(matches!(
+            resolve_target(
+                &sender,
+                "@samealias",
+                &[sender.clone(), first, second],
+                CollaborationScope::Host,
+            ),
+            Err(CollaborationError::AmbiguousTarget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn room_context_lists_peers_in_the_configured_scope() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let current = participant("%1", "s1");
+        let same_room = participant("%2", "s2");
+        let other_room = participant_in_window("%3", "s3", "@other");
+        let participants = vec![current.clone(), same_room, other_room];
+
+        let window = room_context(
+            mailbox.as_ref(),
+            current.clone(),
+            &participants,
+            CollaborationScope::Window,
+        )
+        .await;
+        assert_eq!(window.peers.len(), 1);
+        assert_eq!(window.peers[0].pane, "%2");
+
+        let host = room_context(
+            mailbox.as_ref(),
+            current,
+            &participants,
+            CollaborationScope::Host,
+        )
+        .await;
+        assert_eq!(host.peers.len(), 2);
+        assert!(host.peers.iter().any(|peer| peer.pane == "%2"));
+        assert!(host.peers.iter().any(|peer| peer.pane == "%3"));
     }
 
     /// The bug this whole console notion exists for: pressing `m` on the row

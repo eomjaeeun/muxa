@@ -67,7 +67,7 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your same-tmux-window peer team control plane. \
+const MCP_SERVER_INSTRUCTIONS: &str = "muxa is your peer team control plane. Peer reach is tmux-window-scoped by default and may be host-wide when configured. \
     Use muxa_guide for the user's surface/agent launch preferences, muxa_room_context \
     for identity/peers, and muxa_collaboration_guide only when detailed collaboration \
     guidance is needed. Reserved @peer/@muxa-peer requests for new \
@@ -735,7 +735,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_room_context",
-            "description": "Identify this agent and list collaboration peers in the same tmux window, plus unread request and reply counts. Use the returned pane, alias, role, and state to choose an appropriate reviewer or delegated subagent.",
+            "description": "Identify this agent and list collaboration peers in the configured scope (same tmux window by default, or host-wide), plus unread request and reply counts. Use the returned pane, alias, role, and state to choose an appropriate reviewer or delegated subagent.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({

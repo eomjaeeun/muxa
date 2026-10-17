@@ -507,11 +507,12 @@ Response: `{ "ok": true, "protocol": 3, "capture": "<visible pane text>" }`.
 
 #### Collaboration mailbox
 
-These additive methods back the high-level same-window tools documented in
+These additive methods back the high-level collaboration tools documented in
 `docs/COLLABORATION.md`. `origin` is derived by muxa's CLI/MCP process from
 `TMUX_PANE` and the tmux socket; the daemon correlates it with live agent and
 pane topology. The default target `peer` is accepted only when exactly one
-other agent occupies the same stable tmux window.
+other agent is available in the configured scope (the same stable tmux window
+by default, or the host when host scope is enabled).
 
 ```json
 { "protocol": 3, "kind": "collaboration_context",

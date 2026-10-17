@@ -3304,6 +3304,7 @@ async fn handle(
                                     collaboration.as_ref(),
                                     current,
                                     &topology.participants,
+                                    collaboration.scope(),
                                 )
                                 .await,
                             ),
@@ -3368,6 +3369,7 @@ async fn handle(
                                     collaboration.as_ref(),
                                     current,
                                     &topology.participants,
+                                    collaboration.scope(),
                                 )
                                 .await,
                             ),
