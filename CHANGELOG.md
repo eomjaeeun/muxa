@@ -698,7 +698,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter it could never start with.
 
   `/` is now the only way in. Before it, a letter is either a binding or a
-  no-op that answers `press / to filter`; after it, every key — `q`, `j`, `C`,
+  silent no-op; after it, every key — `q`, `j`, `C`,
   the whole reserved set — is an ordinary filter character, so no search term
   is out of reach. Esc and Ctrl-U still clear the filter and back out.
 

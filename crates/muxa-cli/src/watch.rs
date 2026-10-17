@@ -11213,9 +11213,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // bracketed paste, not as keystrokes — silently seeded the query,
             // and every plain key after it typed into a filter the user never
             // opened.
-            if app.browse_keys_active() {
-                app.set_hint("press / to filter", HintLevel::Warn);
-            } else {
+            if !app.browse_keys_active() {
                 app.edit_search(|query| query.push_str(&pasted.replace(['\r', '\n'], " ")));
             }
         }
@@ -11643,13 +11641,9 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             Action::None
         }
         // A keystroke is text only after `/` armed the filter. Before that
-        // every letter is a binding, so an unbound one does nothing — and
-        // says where the filter went, because typing used to open it and
-        // that reflex outlives the change.
+        // every letter is a binding, so an unbound one does nothing.
         KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.browse_keys_active() {
-                app.set_hint("press / to filter", HintLevel::Warn);
-            } else {
+            if !app.browse_keys_active() {
                 app.edit_search(|query| query.push(c));
             }
             Action::None
@@ -22042,12 +22036,7 @@ mod tests {
 
         assert!(matches!(key_action(&mut app, 'x'), Action::None));
         assert!(app.search_query.is_empty(), "a bare letter must not filter");
-        let hint = app.footer_hint.as_ref().expect("a hint names the way in");
-        assert!(
-            hint.message.contains('/'),
-            "unexpected hint: {}",
-            hint.message
-        );
+        assert!(app.footer_hint.is_none(), "a bare letter must be silent");
 
         assert!(matches!(key_action(&mut app, '/'), Action::None));
         assert!(matches!(key_action(&mut app, 'x'), Action::None));
@@ -31870,6 +31859,7 @@ sort = ["state"]
         let action = handle_event(Event::Paste("한글".into()), &mut app);
         assert!(matches!(action, Action::None));
         assert_eq!(app.search_query, "");
+        assert!(app.footer_hint.is_none(), "an unarmed paste must be silent");
 
         // Armed with `/`, it behaves as before.
         app.arm_explicit_search();
