@@ -109,6 +109,51 @@ pub fn scan_pane_workload(pane: &PaneInfo) -> WorkloadSummary {
     summarize(read_descendants(pane.pane_pid))
 }
 
+/// Walk `root`'s descendants for the host-side `docker exec -it` client and
+/// return its container name or id.
+#[cfg(target_os = "linux")]
+pub fn docker_container_for_pid(root: u32) -> Option<String> {
+    if root == 0 {
+        return None;
+    }
+    read_descendants(root)
+        .into_iter()
+        .find_map(|process| docker_container_from_cmdline(&process.cmdline))
+}
+
+/// Container process discovery is currently backed by Linux `/proc`.
+#[cfg(not(target_os = "linux"))]
+pub fn docker_container_for_pid(_root: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn docker_container_from_cmdline(cmdline: &str) -> Option<String> {
+    let tokens: Vec<&str> = cmdline.split_whitespace().collect();
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| **token == "exec")
+        .find_map(|(exec_index, _)| {
+            let flags = tokens.get(exec_index + 1)?.strip_prefix('-')?;
+            if flags.starts_with('-')
+                || !flags.contains('i')
+                || !flags.contains('t')
+                || !tokens[..exec_index]
+                    .iter()
+                    .any(|token| command_name(token) == "docker")
+            {
+                return None;
+            }
+            let candidates: Vec<&str> = tokens[exec_index + 1..]
+                .iter()
+                .copied()
+                .filter(|token| !token.starts_with('-') && !token.contains('='))
+                .collect();
+            (candidates.len() >= 2).then(|| candidates[candidates.len() - 2].to_string())
+        })
+}
+
 fn summarize(procs: Vec<ProcessInfo>) -> WorkloadSummary {
     let parent_by_pid: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.parent_pid)).collect();
     let primary_pid = procs
@@ -335,6 +380,37 @@ mod tests {
             comm: comm.into(),
             cmdline: cmdline.into(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn docker_exec_cmdline_resolves_container() {
+        assert_eq!(
+            docker_container_from_cmdline("docker exec -it je-dev zsh"),
+            Some("je-dev".into())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_docker_cmdline_has_no_container() {
+        assert_eq!(docker_container_from_cmdline("claude --resume abc"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn docker_exec_without_container_and_command_has_no_container() {
+        assert_eq!(docker_container_from_cmdline("docker exec -it zsh"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_interactive_docker_exec_in_shell_script_has_no_container() {
+        let cmdline = r#"/usr/bin/zsh -c "source /tmp/snapshot.sh && eval 'for mode in none sg sa pl all; do
+  docker exec je-exp-1-2 bash -c \"cd /home/user/ProtoGo && ./spawn.sh\"
+done' < /dev/null && pwd -P >| /tmp/claude-8169-cwd""#;
+
+        assert_eq!(docker_container_from_cmdline(cmdline), None);
     }
 
     #[test]

@@ -715,10 +715,9 @@ fn event_touches_activity(agent: &Agent, ev: &AgentEvent) -> bool {
         // resurrecting a row's unread mark with nothing new to read. The
         // other levels (NeedsInput/NeedsChoice/Error) do flip the state
         // and stay activity.
-        AgentEvent::NotificationFired { level, .. } => !matches!(
-            level,
-            NotificationLevel::Info | NotificationLevel::Warning
-        ),
+        AgentEvent::NotificationFired { level, .. } => {
+            !matches!(level, NotificationLevel::Info | NotificationLevel::Warning)
+        }
         AgentEvent::Started { .. }
         | AgentEvent::PromptSubmitted { .. }
         | AgentEvent::TurnStopped { .. }

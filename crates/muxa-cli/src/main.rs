@@ -20,6 +20,7 @@ mod mux_control;
 mod onboarding;
 mod peek;
 mod relay;
+mod snapshot_cmd;
 mod stats;
 mod theme;
 mod time_range;
@@ -169,6 +170,8 @@ enum Cmd {
     /// Read and replace the daemon's config.toml, the same way Muxa.app's
     /// Advanced settings does.
     Config(config_cmd::Args),
+    /// Save or restore tmux layouts and their tracked agent sessions.
+    Snapshot(snapshot_cmd::Args),
     /// Manage local/SSH host inventory and Kubernetes-style metadata.
     Host(fleet_cli::HostArgs),
     /// Observe and control this node plus SSH-connected Muxa hosts.
@@ -1229,6 +1232,7 @@ async fn main() -> Result<()> {
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
         Cmd::Automation(a) => automation::run(a, &client).await,
         Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
+        Cmd::Snapshot(a) => snapshot_cmd::run(a, socket.clone()).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => fleet_cli::run_fleet(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Agent { action } => run_agent_cmd(action, &client, &socket, &cfg).await,

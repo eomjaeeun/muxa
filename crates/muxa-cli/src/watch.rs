@@ -5786,7 +5786,11 @@ impl App {
         let panes = window_agent_panes(window);
         self.window_pane_choice
             .get(&window.key)
-            .and_then(|chosen| panes.iter().find(|pane| pane.key.pane_id.as_str() == chosen))
+            .and_then(|chosen| {
+                panes
+                    .iter()
+                    .find(|pane| pane.key.pane_id.as_str() == chosen)
+            })
             .or_else(|| panes.first())
             .copied()
     }
@@ -12551,7 +12555,11 @@ fn handle_keepalive_panel_event(code: KeyCode, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Char('d') => {
-            match app.keepalive_panel.entries.get(app.keepalive_panel.selected) {
+            match app
+                .keepalive_panel
+                .entries
+                .get(app.keepalive_panel.selected)
+            {
                 Some(entry) => Action::StopKeepalive(entry.pane.clone()),
                 None => Action::NotApplicable("keepalive: no schedule selected"),
             }
@@ -14128,7 +14136,9 @@ fn render_keepalive_popup(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("every "),
         Span::styled(
             seconds,
-            Style::default().fg(theme.action).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.action)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
             "s, Enter -> {count} pane{}",
@@ -14194,7 +14204,10 @@ fn render_keepalive_panel(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw(keepalive_pane_label(app, &entry.pane)),
                 Span::raw(format!(" · every {}s · ", entry.interval_secs)),
                 status,
-                Span::raw(format!(" · up {}", collab_screen::age(now, entry.started_at))),
+                Span::raw(format!(
+                    " · up {}",
+                    collab_screen::age(now, entry.started_at)
+                )),
             ])
         })
         .collect();
@@ -21388,7 +21401,10 @@ mod tests {
     #[test]
     fn shift_p_opens_the_keepalive_panel_and_d_stops_the_selected_schedule() {
         let mut app = two_pane_window_app();
-        assert!(matches!(key_action(&mut app, 'P'), Action::OpenKeepalivePanel));
+        assert!(matches!(
+            key_action(&mut app, 'P'),
+            Action::OpenKeepalivePanel
+        ));
 
         // The run loop would have fetched these from the daemon; the
         // handler under test only reads what is already in state.

@@ -218,8 +218,7 @@ fn classify_transcript_line(line: &str) -> Option<TurnOutcome> {
 /// start of a trimmed line keeps the real signal and drops the quotes.
 fn tool_result_reports_rate_limit(text: &str) -> bool {
     text.lines().map(str::trim_start).any(|line| {
-        line.starts_with("You've hit your limit")
-            || line.starts_with("Claude usage limit reached")
+        line.starts_with("You've hit your limit") || line.starts_with("Claude usage limit reached")
     })
 }
 
