@@ -59,8 +59,10 @@ use crate::work_control::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2238,6 +2240,35 @@ fn unique_pane_endpoint(pane: &str, agents: &[Agent]) -> Result<Option<String>, 
     }
 }
 
+/// Build the operation performed by every keepalive timer tick. Startup
+/// restoration and the IPC start request share this exact routing path.
+pub type KeepaliveTickFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+pub type KeepaliveTick = Arc<dyn Fn(String) -> KeepaliveTickFuture + Send + Sync>;
+
+pub fn keepalive_tick(backends: Vec<SharedBackend>, store: SharedStore) -> KeepaliveTick {
+    Arc::new(move |pane| {
+        let backends = backends.clone();
+        let store = store.clone();
+        Box::pin(async move {
+            let Ok(target) = resolve_backend(&backends, &pane) else {
+                return;
+            };
+            if !target.caps().send_text {
+                return;
+            }
+            let agents = store.by_pane(&pane).await;
+            let Ok(socket) = unique_pane_endpoint(&pane, &agents) else {
+                return;
+            };
+            let target = target.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                target.send_text_on(socket.as_deref(), &pane, "\r")
+            })
+            .await;
+        })
+    })
+}
+
 /// The pane inventory a collaboration call is resolved against, plus the
 /// participants derived from it. The raw panes travel alongside because an
 /// operator console origin has no participant row — its room comes from the
@@ -3681,30 +3712,9 @@ async fn handle(
                 } => {
                     kind = "keepalive_start";
                     let interval = Duration::from_secs(interval_secs.max(1));
-                    let tick_backends = backends.clone();
-                    let tick_store = store.clone();
+                    let tick = keepalive_tick(backends.clone(), store.clone());
                     keepalive
-                        .start(pane.clone(), interval, move |pane| {
-                            let backends = tick_backends.clone();
-                            let store = tick_store.clone();
-                            async move {
-                                let Ok(target) = resolve_backend(&backends, &pane) else {
-                                    return;
-                                };
-                                if !target.caps().send_text {
-                                    return;
-                                }
-                                let agents = store.by_pane(&pane).await;
-                                let Ok(socket) = unique_pane_endpoint(&pane, &agents) else {
-                                    return;
-                                };
-                                let target = target.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    target.send_text_on(socket.as_deref(), &pane, "\r")
-                                })
-                                .await;
-                            }
-                        })
+                        .start(pane.clone(), interval, move |pane| tick(pane))
                         .await;
                     Response::with_keepalive_list(keepalive.list().await)
                 }

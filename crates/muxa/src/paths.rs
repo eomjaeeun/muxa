@@ -8,6 +8,7 @@ pub const CONFIG_FILENAME: &str = "config.toml";
 pub const HISTORY_FILENAME: &str = "prompts.ndjson";
 pub const ACTIVITY_FILENAME: &str = "activity.ndjson";
 pub const STATE_FILENAME: &str = "state.json";
+pub const KEEPALIVE_FILENAME: &str = "keepalive.json";
 pub const SESSION_ACTIVITY_FILENAME: &str = "session-activity.json";
 pub const COLLABORATION_FILENAME: &str = "collaboration.json";
 pub const COLLABORATION_AUDIT_FILENAME: &str = "collaboration-audit.ndjson";
@@ -55,6 +56,13 @@ pub fn default_activity_file() -> Option<PathBuf> {
 /// the prompt history so a single backup or rotation policy covers both.
 pub fn default_state_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
+}
+
+/// Default durable keepalive schedule file:
+/// `$XDG_DATA_HOME/muxa/keepalive.json`. Data, not config: this records the
+/// schedules currently owned by the daemon so they survive a restart.
+pub fn default_keepalive_file() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join(CONFIG_DIRNAME).join(KEEPALIVE_FILENAME))
 }
 
 /// Where `muxa watch` remembers which agents the operator has already read:

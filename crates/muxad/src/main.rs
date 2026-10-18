@@ -27,7 +27,7 @@ use muxa::config::{CollaborationWake, CollaborationWakePayload};
 use muxa::config::{DashboardAuthMode, NotifierBackend};
 use muxa::dashboard::{DashboardConfig, DashboardOverrides};
 use muxa::history::{HistoryOptions, PaneSessionCache, PromptHistory};
-use muxa::ipc::{harden_permissions, Client, RestartController, Server};
+use muxa::ipc::{harden_permissions, keepalive_tick, Client, RestartController, Server};
 use muxa::notify::Notifier;
 use muxa::pipeline_run::PipelineRunStore;
 use muxa::reconcile::Reconciler;
@@ -187,7 +187,14 @@ async fn main() -> Result<()> {
     let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg, config_path.clone()).await;
     let automation = build_automation(&cfg, config_path.clone());
-    let keepalive = muxa::keepalive::KeepaliveStore::with_tmux_focus_tracking();
+    let keepalive_path = paths::default_keepalive_file();
+    if keepalive_path.is_none() {
+        tracing::warn!(
+            "could not resolve keepalive persistence path; schedules are in-memory only"
+        );
+    }
+    let keepalive =
+        muxa::keepalive::KeepaliveStore::with_tmux_focus_tracking(keepalive_path.clone());
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
 
@@ -200,6 +207,26 @@ async fn main() -> Result<()> {
     // `primary` (first) backend — or, for a host-specific consumer, the
     // matching backend from the set.
     let backends: Vec<muxa::SharedBackend> = muxa::active_backends();
+    let persisted_keepalives = match keepalive_path.as_deref() {
+        Some(path) => muxa::keepalive::load(path).await,
+        None => Vec::new(),
+    };
+    let restored_count = persisted_keepalives.len();
+    let tick = keepalive_tick(backends.clone(), store.clone());
+    for record in persisted_keepalives {
+        let schedule_tick = tick.clone();
+        keepalive
+            .start(
+                record.pane,
+                std::time::Duration::from_secs(record.interval_secs),
+                move |pane| schedule_tick(pane),
+            )
+            .await;
+    }
+    tracing::info!(
+        schedules = restored_count,
+        "rehydrated keepalive schedules from snapshot"
+    );
     // Never empty (see `active_backends`); `primary` is the conventional
     // single-backend handle for consumers a namespace can't disambiguate.
     // `active_backends` orders the set by env preference, so `backends[0]` is

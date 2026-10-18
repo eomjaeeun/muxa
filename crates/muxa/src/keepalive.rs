@@ -15,21 +15,111 @@
 //! A keepalive schedule is the opposite — the operator started it on
 //! purpose, for exactly this pane, and stops it on purpose too.
 //!
-//! Schedules are in-memory only. A muxad restart drops them, same as it
-//! would drop the shell loop this replaces; nothing here is durable.
+//! Daemon-owned schedules are persisted to the XDG data directory and
+//! restored when muxad starts. Focus state remains live tmux-derived state
+//! and is deliberately never persisted.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const FOCUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(200);
+pub const KEEPALIVE_SCHEMA_VERSION: u32 = 1;
+
+#[cfg(unix)]
+const KEEPALIVE_FILE_MODE: u32 = 0o600;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedKeepalive {
+    pub pane: String,
+    pub interval_secs: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeepaliveFile {
+    #[serde(default)]
+    v: u32,
+    #[serde(with = "time::serde::rfc3339")]
+    saved_at: OffsetDateTime,
+    schedules: Vec<PersistedKeepalive>,
+}
+
+pub async fn load(path: &Path) -> Vec<PersistedKeepalive> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            debug!(path = %path.display(), "no keepalive file on disk; starting empty");
+            return Vec::new();
+        }
+        Err(error) => {
+            warn!(%error, path = %path.display(), "could not read keepalive file");
+            return Vec::new();
+        }
+    };
+    let parsed: KeepaliveFile = match serde_json::from_slice(&bytes) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn!(%error, path = %path.display(), "keepalive file is corrupt; starting empty");
+            return Vec::new();
+        }
+    };
+    if parsed.v != KEEPALIVE_SCHEMA_VERSION {
+        warn!(file_version = parsed.v, expected = KEEPALIVE_SCHEMA_VERSION,
+            path = %path.display(), "keepalive file has unknown schema version; starting empty");
+        return Vec::new();
+    }
+    parsed.schedules
+}
+
+pub async fn save(path: &Path, records: &[PersistedKeepalive]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    if !parent.as_os_str().is_empty() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("keepalive.json");
+    let tmp = parent.join(format!(".{basename}.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(&KeepaliveFile {
+        v: KEEPALIVE_SCHEMA_VERSION,
+        saved_at: OffsetDateTime::now_utc(),
+        schedules: records.to_vec(),
+    })
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        options.mode(KEEPALIVE_FILE_MODE);
+        let mut file = options.open(&tmp).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    if !parent.as_os_str().is_empty() {
+        if let Ok(dir) = OpenOptions::new().read(true).open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+    Ok(())
+}
 
 /// One schedule as reported to a client — the live fields, not the task
 /// handle backing it.
@@ -61,11 +151,17 @@ pub struct KeepaliveStore {
     entries: RwLock<HashMap<String, Entry>>,
     focused_panes: Arc<RwLock<HashSet<String>>>,
     focus_task: Option<JoinHandle<()>>,
+    persistence_path: Option<PathBuf>,
+    dirty: Arc<Notify>,
+    persistence_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for KeepaliveStore {
     fn drop(&mut self) {
         if let Some(task) = &self.focus_task {
+            task.abort();
+        }
+        if let Ok(Some(task)) = self.persistence_task.get_mut() {
             task.abort();
         }
     }
@@ -78,13 +174,16 @@ impl KeepaliveStore {
             entries: RwLock::new(HashMap::new()),
             focused_panes: Arc::new(RwLock::new(HashSet::new())),
             focus_task: None,
+            persistence_path: None,
+            dirty: Arc::new(Notify::new()),
+            persistence_task: std::sync::Mutex::new(None),
         })
     }
 
     /// Create the daemon store and continuously track panes displayed by real
     /// (non-control-mode) tmux clients.
     #[must_use]
-    pub fn with_tmux_focus_tracking() -> Arc<Self> {
+    pub fn with_tmux_focus_tracking(persistence_path: Option<PathBuf>) -> Arc<Self> {
         let focused_panes = Arc::new(RwLock::new(HashSet::new()));
         let task_focused_panes = Arc::clone(&focused_panes);
         let focus_task = tokio::spawn(async move {
@@ -98,11 +197,36 @@ impl KeepaliveStore {
                 }
             }
         });
-        Arc::new(Self {
+        let store = Arc::new(Self {
             entries: RwLock::new(HashMap::new()),
             focused_panes,
             focus_task: Some(focus_task),
-        })
+            persistence_path: persistence_path.clone(),
+            dirty: Arc::new(Notify::new()),
+            persistence_task: std::sync::Mutex::new(None),
+        });
+        if let Some(path) = persistence_path {
+            let weak_store = Arc::downgrade(&store);
+            let dirty = Arc::clone(&store.dirty);
+            let task = tokio::spawn(async move {
+                loop {
+                    dirty.notified().await;
+                    tokio::time::sleep(PERSIST_DEBOUNCE).await;
+                    let Some(store) = weak_store.upgrade() else {
+                        return;
+                    };
+                    let records = store.persisted_records().await;
+                    if let Err(error) = save(&path, &records).await {
+                        warn!(%error, path = %path.display(), "could not save keepalive schedules");
+                    }
+                }
+            });
+            *store
+                .persistence_task
+                .lock()
+                .expect("keepalive persistence task lock") = Some(task);
+        }
+        store
     }
 
     /// Start a schedule for `pane`, replacing any schedule already running
@@ -148,11 +272,17 @@ impl KeepaliveStore {
                 task,
             },
         );
+        drop(entries);
+        self.mark_dirty();
     }
 
     /// Stop and remove `pane`'s schedule. `true` if one existed.
     pub async fn stop(&self, pane: &str) -> bool {
-        self.entries.write().await.remove(pane).is_some()
+        let removed = self.entries.write().await.remove(pane).is_some();
+        if removed {
+            self.mark_dirty();
+        }
+        removed
     }
 
     /// Immediately treat `panes` as focused. The next tmux focus sample
@@ -176,12 +306,77 @@ impl KeepaliveStore {
         list.sort_by_key(|entry| entry.started_at);
         list
     }
+
+    fn mark_dirty(&self) {
+        if self.persistence_path.is_some() {
+            self.dirty.notify_one();
+        }
+    }
+
+    async fn persisted_records(&self) -> Vec<PersistedKeepalive> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .map(|(pane, entry)| PersistedKeepalive {
+                pane: pane.clone(),
+                interval_secs: entry.interval_secs,
+                started_at: entry.started_at,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn record(pane: &str, interval_secs: u64) -> PersistedKeepalive {
+        PersistedKeepalive {
+            pane: pane.into(),
+            interval_secs,
+            started_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_round_trips_and_bad_inputs_start_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keepalive.json");
+        let expected = record("%7", 42);
+        save(&path, std::slice::from_ref(&expected)).await.unwrap();
+        let loaded = load(&path).await;
+        assert_eq!(loaded[0].pane, expected.pane);
+        assert_eq!(loaded[0].interval_secs, expected.interval_secs);
+
+        let missing = dir.path().join("missing.json");
+        assert!(load(&missing).await.is_empty());
+        tokio::fs::write(&path, b"not json").await.unwrap();
+        assert!(load(&path).await.is_empty());
+        tokio::fs::write(
+            &path,
+            br#"{"v":999,"saved_at":"2025-01-01T00:00:00Z","schedules":[]}"#,
+        )
+        .await
+        .unwrap();
+        assert!(load(&path).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_start_is_persisted_after_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keepalive.json");
+        let store = KeepaliveStore::with_tmux_focus_tracking(Some(path.clone()));
+        store
+            .start("%8".into(), Duration::from_secs(17), |_| async {})
+            .await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let loaded = load(&path).await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].pane, "%8");
+        assert_eq!(loaded[0].interval_secs, 17);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn ticks_the_configured_number_of_times_and_skips_while_focused() {
