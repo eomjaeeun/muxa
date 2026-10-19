@@ -2740,8 +2740,10 @@ pub fn resolve_target(
     participants: &[Participant],
     scope: crate::config::CollaborationScope,
 ) -> Result<Participant, CollaborationError> {
-    // Host scope removes the room restriction for every selector kind. Keep
-    // this explicit-pane path so pane targets retain their established direct
+    // Host scope removes the room restriction for explicitly named targets.
+    // The singular, implicit `peer` shorthand is the exception: it always
+    // means the one other participant in the sender's room. Keep this
+    // explicit-pane path so pane targets retain their established direct
     // lookup and ambiguity behavior across tmux endpoints.
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
@@ -2766,7 +2768,11 @@ pub fn resolve_target(
         })
         .collect();
     if selector == "peer" {
-        return match peers.as_slice() {
+        let room_peers: Vec<_> = participants
+            .iter()
+            .filter(|candidate| !candidate.same_endpoint(sender) && candidate.room == sender.room)
+            .collect();
+        return match room_peers.as_slice() {
             [peer] => Ok((*peer).clone()),
             [] => Err(CollaborationError::NoPeer),
             _ => Err(CollaborationError::AmbiguousTarget(selector.to_string())),
@@ -4679,17 +4685,19 @@ mod tests {
     }
 
     #[test]
-    fn peer_selector_refuses_ambiguity() {
+    fn peer_selector_refuses_room_local_ambiguity_in_every_scope() {
         let sender = participant("%1", "sender");
         let peers = vec![
             sender.clone(),
             participant("%2", "two"),
             participant("%3", "three"),
         ];
-        assert!(matches!(
-            resolve_target(&sender, "peer", &peers, CollaborationScope::Window),
-            Err(CollaborationError::AmbiguousTarget(_))
-        ));
+        for scope in [CollaborationScope::Window, CollaborationScope::Host] {
+            assert!(matches!(
+                resolve_target(&sender, "peer", &peers, scope),
+                Err(CollaborationError::AmbiguousTarget(_))
+            ));
+        }
         assert_eq!(
             resolve_target(&sender, "%2", &peers, CollaborationScope::Window)
                 .unwrap()
@@ -4699,7 +4707,7 @@ mod tests {
     }
 
     #[test]
-    fn host_scope_reaches_every_selector_in_other_rooms() {
+    fn host_scope_reaches_explicit_selectors_in_other_rooms() {
         let sender = participant("%1", "s1");
         let mut other_room = participant("%99", "s99");
         other_room.room.window_id = "@other".into();
@@ -4707,7 +4715,7 @@ mod tests {
         other_room.roles = vec!["review".into()];
         let peers = vec![sender.clone(), other_room];
 
-        for selector in ["%99", "pane:%99", "peer", "@reviewer", "role:review"] {
+        for selector in ["%99", "pane:%99", "@reviewer", "role:review"] {
             assert_eq!(
                 resolve_target(&sender, selector, &peers, CollaborationScope::Host)
                     .unwrap()
@@ -4715,6 +4723,40 @@ mod tests {
                 "%99"
             );
         }
+    }
+
+    #[test]
+    fn host_scope_peer_does_not_resolve_across_rooms() {
+        let sender = participant("%1", "s1");
+        let other_room = participant_in_window("%99", "s99", "@other");
+
+        assert!(matches!(
+            resolve_target(
+                &sender,
+                "peer",
+                &[sender.clone(), other_room],
+                CollaborationScope::Host,
+            ),
+            Err(CollaborationError::NoPeer)
+        ));
+    }
+
+    #[test]
+    fn host_scope_peer_selects_the_only_room_mate_among_host_peers() {
+        let sender = participant("%1", "s1");
+        let room_mate = participant("%2", "s2");
+        let peers = vec![
+            sender.clone(),
+            room_mate.clone(),
+            participant_in_window("%3", "s3", "@other-a"),
+            participant_in_window("%4", "s4", "@other-b"),
+            participant_in_window("%5", "s5", "@other-c"),
+        ];
+
+        assert_eq!(
+            resolve_target(&sender, "peer", &peers, CollaborationScope::Host).unwrap(),
+            room_mate
+        );
     }
 
     #[test]

@@ -130,9 +130,10 @@
 # even after the live agent record has been reaped (daemon restart, pane
 # close, etc.). Default path lives in $XDG_DATA_HOME.
 # window (default): requests stay inside the sender's tmux window.
-# host: every selector and peer listing may reach any tracked agent on this
-# host. This also lets `muxa watch`'s composer send to the row under the cursor.
-# Duplicate room-local aliases become ambiguous when matched host-wide.
+# host: explicit selectors and peer listing may reach any tracked agent on this
+# host; the implicit bare `peer` selector remains room-scoped. This also lets
+# `muxa watch`'s composer send to the row under the cursor. Duplicate room-local
+# aliases become ambiguous when matched host-wide.
 # scope = "window"
 
 # Central physical-host management over persistent, outbound OpenSSH stdio

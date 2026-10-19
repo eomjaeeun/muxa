@@ -2863,8 +2863,17 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
+    wait_for_reply_from_origin(client, &origin, request_id, timeout_secs).await
+}
+
+async fn wait_for_reply_from_origin(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    request_id: &str,
+    timeout_secs: u64,
+) -> Value {
     match client
-        .collaboration_wait(&origin, request_id, timeout_secs)
+        .collaboration_wait(origin, request_id, timeout_secs)
         .await
     {
         Ok(request) if request.status.is_terminal() => json_result(&request_outcome(&request)),
@@ -2872,6 +2881,11 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
             "completed": false,
             "reason": "timeout",
             "request_id": request_id,
+            "next_step": format!(
+                "this is not an error: request {request_id} is still queued and may complete later. \
+                 Call muxa_wait_reply again with the same request_id, or check \
+                 muxa_inbox/muxa_peer_report later; do not treat the request as lost."
+            ),
         })),
         Err(error) => error_result(&format!("wait_reply failed: {error}")),
     }
@@ -4476,6 +4490,67 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_reply_timeout_says_pending_request_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-wait-reply.sock");
+        let store = Store::shared();
+        for (kind, session_id, pane) in [
+            (AgentKind::Codex, "sender", "%1"),
+            (AgentKind::ClaudeCode, "recipient", "%2"),
+        ] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: muxa::event::AgentId {
+                        kind,
+                        session_id: session_id.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: Some("/repo".into()),
+                    },
+                    at: time::OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+        let backend: SharedBackend = Arc::new(RegistrationBackend {
+            panes: vec![registration_pane("%1", "0"), registration_pane("%2", "1")],
+        });
+        let server = Server::new(sock.clone(), store).with_backends(vec![backend]);
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let client = Client::new(sock);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+        };
+        let request = client
+            .collaboration_send(
+                &origin,
+                "%2",
+                &NewRequest {
+                    body: "reply later".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = wait_for_reply_from_origin(&client, &origin, &request.id, 1).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["completed"], false, "{text}");
+        assert_eq!(payload["reason"], "timeout", "{text}");
+        let next_step = payload["next_step"].as_str().unwrap();
+        assert!(next_step.contains("not an error"), "{text}");
+        assert!(next_step.contains("still queued"), "{text}");
+
+        shutdown.send(()).unwrap();
+        daemon.await.unwrap();
     }
 
     #[test]

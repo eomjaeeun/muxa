@@ -751,9 +751,11 @@ pub struct CollaborationConfig {
     /// How far collaboration addressing and peer discovery may reach.
     /// `window` (default) keeps requests inside the sender's tmux window —
     /// co-locating agents in a window is the consent to let them talk. `host`
-    /// exposes every tracked agent on this host to all selector kinds and to
-    /// peer listing. Aliases remain room-locally unique, so a duplicate alias
-    /// across rooms is rejected as an ambiguous host-wide target.
+    /// exposes every tracked agent on this host to explicit selectors and to
+    /// peer listing. The implicit bare `peer` selector remains room-scoped,
+    /// where its singular shorthand can identify one room-mate. Aliases remain
+    /// room-locally unique, so a duplicate alias across rooms is rejected as
+    /// an ambiguous host-wide target.
     pub scope: CollaborationScope,
     #[serde(default = "default_collaboration_max_message_bytes")]
     pub max_message_bytes: usize,
